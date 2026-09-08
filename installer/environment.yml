@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# typeCAD Zephyr installer — host build tools (conda-forge), cross-platform base.
+#
+# This file lists ONLY packages that exist on conda-forge for every platform
+# (linux-64, linux-aarch64, osx-64, osx-arm64, win-64). Platform-limited tools
+# are NOT listed here because micromamba's solver does not honor environment.yml
+# line selectors (e.g. `# [not win]`) — they are added by a follow-up
+# `micromamba install` in the install scripts instead:
+#
+#   install.sh  →  dtc, openocd   (POSIX only; conda-forge has no win-64 builds)
+#   install.ps1 →  7zip            (Windows only; needed to extract the .7z SDK)
+#
+# The cross-compilers themselves come from the official Zephyr SDK bundle,
+# fetched separately by the install scripts — not from conda.
+#
+# Create with:  micromamba create -y -f environment.yml -n zephyr
+# ---------------------------------------------------------------------------
+name: zephyr
+channels:
+  - conda-forge
+dependencies:
+  # Python + west (Zephyr's build orchestrator).
+  - python=3.12
+  - west>=1.2
+  # Core build tools Zephyr's CMake expects on the host (all available cross-platform).
+  # cmake pinned <4: Zephyr 4.3.x's FindZephyr-sdk.cmake uses an unquoted
+  # ${VAR} in an if() that CMake 4.x rejects ("Unknown arguments specified"),
+  # while CMake 3.x handles the empty expansion. Loosen once a Zephyr rev that
+  # supports CMake 4.x is pinned in versions.env.
+  - cmake>=3.20,<4
+  - ninja
+  - gperf
+  # Compiler cache. Zephyr's cmake/modules/ccache.cmake auto-routes compiles
+  # AND links through ccache whenever it is on PATH (opt out with USE_CCACHE=0;
+  # ccache's per-user default cache dir is already shared across projects).
+  # Build dirs that must start fresh (config/board changes) then replay from
+  # cache instead of recompiling every unchanged Zephyr library object.
+  - ccache
+  # Python helpers west/CMake invoke.
+  - pyelftools
+  - packaging
+  - pip
+  # west's runner registry imports every flash/debug runner; several (e.g.
+  # rtsflash) `import usb` (pyusb). Without it every west build/flash prints
+  # "The module for runner 'rtsflash' could not be imported" noise.
+  - pyusb

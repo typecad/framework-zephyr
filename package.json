@@ -1,0 +1,81 @@
+{
+  "name": "@typecad/framework-zephyr",
+  "version": "1.0.0-alpha.17",
+  "description": "TypeCAD framework package for the Zephyr RTOS \u2014 west/CMake build, devicetree-driven GPIO",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./display": {
+      "types": "./dist/display/index.d.ts",
+      "default": "./dist/display/index.js"
+    },
+    "./framework.manifest": {
+      "types": "./dist/framework.manifest.d.ts",
+      "default": "./dist/framework.manifest.js"
+    }
+  },
+  "bin": {
+    "zephyr-installer": "installer/install.mjs",
+    "typecad-zephyr-install": "installer/install.mjs"
+  },
+  "files": [
+    "dist",
+    "src",
+    "installer"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run --root ../.. tests/packages/framework-zephyr/manifest.test.ts tests/packages/framework-zephyr/installer-tests/",
+    "test:coverage": "npm test && tsx ../../scripts/render-framework-coverage.ts",
+    "hal": "node hal/run.mjs",
+    "setup": "node installer/install.mjs",
+    "dry-run": "node installer/install.mjs --dry-run"
+  },
+  "dependencies": {
+    "@typecad/cuttlefish": "1.0.0-alpha.17"
+  },
+  "devDependencies": {
+    "@typecad/hal": "1.0.0-alpha.17",
+    "typescript": "^5.7.3"
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/justind000/typecode.git",
+    "directory": "packages/framework-zephyr"
+  },
+  "homepage": "https://github.com/justind000/typecode/tree/main/packages/framework-zephyr",
+  "bugs": {
+    "url": "https://github.com/justind000/typecode/issues"
+  },
+  "keywords": [
+    "ble",
+    "cpp",
+    "cuttlefish",
+    "embedded",
+    "firmware",
+    "framework",
+    "gpio",
+    "microcontroller",
+    "nordic",
+    "nrf52840",
+    "rtos",
+    "typecad",
+    "typescript",
+    "zephyr"
+  ],
+  "engines": {
+    "node": ">=22.11.0"
+  },
+  "author": "typecad0",
+  "sideEffects": false
+}
