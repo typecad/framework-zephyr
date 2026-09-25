@@ -10,7 +10,9 @@
 import { writeFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveKconfigFragments, type KconfigUsage } from '../dt-config/kconfig.js';
-import { scanSensorParts } from './index.js';
+import { scanSensorParts, scanStrips, scanHid, scanMatrix } from './index.js';
+import { profileFromEmittedSource, transportFor, panelControllerFor } from '../display/profiles.js';
+import { readDisplayBinding } from '../display/bindings.js';
 import { readCuttlefishLibrarySidecar } from '@typecad/cuttlefish/library-packages';
 import { SENSOR_PART_INFO } from '@typecad/hal';
 
@@ -96,7 +98,7 @@ export function appendLibraryOverlayFragments(overlay: string, projectRoot: stri
  *
  * Idempotent. Mirrors scaffoldEspIdfProject's writeIfChanged discipline.
  */
-export function scaffoldZephyrProject(projectRoot: string, debug = false, userKconfig?: Record<string, string>, psram?: 'opi' | 'quad'): boolean {
+export function scaffoldZephyrProject(projectRoot: string, debug = false, userKconfig?: Record<string, string>, psram?: 'opi' | 'quad', trace?: { enabled?: boolean; intervalMs?: number }): boolean {
   const srcDir = join(projectRoot, 'src');
   if (!existsSync(srcDir)) mkdirSync(srcDir, { recursive: true });
 
@@ -122,6 +124,22 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
   const usage: KconfigUsage = {
     usesAdc: uses('adc_'),
     usesPwm: uses('pwm_'),
+    usesStrip: uses('led_strip'),
+    strips: scanStrips(src),
+    // Sensor parts drive CONFIG_W1 (1-Wire masters) and the exception
+    // lines; the same scan the exception block below re-runs.
+    sensorParts: scanSensorParts(src),
+    usesHid: uses('__tc_hid_'),
+    hidProtocol: scanHid(src),
+    usesMatrix: uses('__tc_matrix'),
+    matrix: scanMatrix(src),
+    usesPower: uses('sys_poweroff'),
+    usesClock: uses('__tc_rtc'),
+    usesCan: uses('can_'),
+    canLoopback: uses('CAN_MODE_LOOPBACK'),
+    usesI2s: uses('i2s_'),
+    // No chip facts at scaffold time — the prepare overlay omits the shim;
+    // the chip-aware build path synthesizes it.
     usesDac: uses('dac_') || uses('__tc_dac'),
     usesFS: uses('__tc_fs'),
     usesHwtimer: uses('counter_') || uses('__tc_hw'),
@@ -130,6 +148,9 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
     // call yet), but the shim still declared DEVICE_DT_GET(DT_NODELABEL(...))
     // so the overlay must enable the node or the device symbol is missing.
     usesI2c: uses('i2c_') || uses('__tc_i2c'),
+    // I2C target mode: every i2c.resp_* lowering calls i2c_target_register
+    // (and the shim's state carries the i2c_target_* vocabulary).
+    usesI2cTarget: uses('i2c_target_'),
     // DT-bound sensor parts: the __tc_sensor_* state references and the
     // sensor_sample_fetch/sensor_channel_get calls both carry the token.
     usesSensor: uses('sensor_') || uses('__tc_sensor'),
@@ -138,12 +159,28 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
     usesUart: uses('uart_') || uses('__tc_uart'),
     // USB CDC serial: every usb.* lowering calls into the __tc_usb<N>_* shim
     // (device + init helper emitted under usesUsb).
-    usesUsb: uses('__tc_usb'),
+    usesUsb: uses('__tc_usb0'),
     // STM32F4 DBGMCU keep-SWD-alive init present (emitted for stm32f4 socs).
     usesStm32DebugSleep: uses('__tc_stm32_dbgmcu'),
     usesWdt: uses('wdt_'),
     usesBle: uses('bt_') || uses('bt_gatt') || uses('bt_le_'),
     usesDisplay: uses('display_write') || uses('display_init') || uses('display_fill_rect') || uses('__tc_display_dev') || uses('CuttlefishDisplayTarget'),
+    // Display transport + controller: recovered from the profile marker the
+    // display adapters stamp into the emitted source (the profile registry is
+    // the single source of truth — no geometry re-derivation here).
+    ...((): Pick<KconfigUsage, 'displayTransport' | 'displayController' | 'displayBus' | 'displayKconfigExtra'> => {
+      const profile = profileFromEmittedSource(src);
+      if (!profile) return {};
+      // Registry profiles name a DT compatible via dtCompatible (the driver
+      // id itself isn't one); drop-in profiles use the driver string directly.
+      const bus = readDisplayBinding(profile.dtCompatible ?? profile.driver)?.busFamily;
+      if (bus === 'i2c') return { displayBus: 'i2c' };
+      // Board-provided panels (native_sim's sdl_dc) carry their own fragments
+      // and no bus at all.
+      if (profile.boardProvidesDisplay) return { displayKconfigExtra: profile.kconfig };
+      if (transportFor(profile) !== 'zephyr-display') return {};
+      return { displayTransport: 'zephyr-display', displayController: panelControllerFor(profile) };
+    })(),
     usesTouch: uses('ft6336u') || uses('touch_'),
     // (The power HAL is removed; its former pm_/k_sleep token scan is gone —
     // nothing here must match tx_power_dbm's `power` substring.)
@@ -265,6 +302,28 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
         if (userKconfig && sym !== undefined && userKconfig.hasOwnProperty(sym)) continue;
         prjConf.push(line);
       }
+    }
+  }
+  // ── Trace heartbeat Kconfig ────────────────────────────────────────────────
+  // zephyr.trace.enabled in typecad-hal.config.ts turns on the [TR: sampler
+  // (emitted by the strategy at transpile time from the same config record).
+  // The symbol set is exactly what the sampler calls: runtime stats
+  // (k_thread_runtime_stats_*), the monitor list (k_thread_foreach —
+  // kernel/thread_monitor.c only links under THREAD_MONITOR), thread names
+  // (k_thread_name_get/set), and stack inspection (0xAA fill +
+  // stack_info.size). User zephyr.kconfig overrides still win.
+  if (trace?.enabled === true) {
+    const traceSymbols: Array<[string, string]> = [
+      ['CONFIG_THREAD_RUNTIME_STATS', 'y'],
+      ['CONFIG_THREAD_MONITOR', 'y'],
+      ['CONFIG_THREAD_NAME', 'y'],
+      ['CONFIG_INIT_STACKS', 'y'],
+      ['CONFIG_THREAD_STACK_INFO', 'y'],
+    ];
+    prjConf.push('', '# Trace heartbeat (typecad-hal.config.ts → zephyr.trace).');
+    for (const [sym, val] of traceSymbols) {
+      if (userKconfig && userKconfig.hasOwnProperty(sym)) continue;
+      prjConf.push(`${sym}=${val}`);
     }
   }
   // Per-part Kconfig exceptions: catalog parts whose driver is NOT default-y
