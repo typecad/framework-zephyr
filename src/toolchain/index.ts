@@ -21,12 +21,14 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { connect as netConnect } from 'node:net';
 import { basename, delimiter, dirname, join } from 'node:path';
-import { readdirSync, readFileSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
-import type { ToolchainOptions, CompileResult, UploadResult } from '@typecad/cuttlefish/api/shared';
+import { readdirSync, readFileSync, mkdirSync, rmSync, existsSync, writeFileSync, statSync } from 'node:fs';
+import type { ToolchainOptions, CompileResult, UploadResult, MemoryUsage } from '@typecad/cuttlefish/api/shared';
 import { parseCompileErrors } from '@typecad/cuttlefish/api/shared';
 import { scaffoldZephyrProject, writeIfChanged, appendLibraryOverlayFragments } from './scaffold.js';
 import { parseZephyrDts, asBuiltJson } from '../as-built.js';
 import { stampBuildSbom } from '../sbom.js';
+import { commandBlock } from '@typecad/cuttlefish/utils/ui';
+import { ZEPHYR_INSTALL_CMD, locateZephyrBaseCheap } from '@typecad/cuttlefish/board-catalog';
 import { westSpawn, buildEnv } from './west-spawn.js';
 import { discoverWest } from './west-discover.js';
 import { writeDebugConfig, resolveDebugLocations, debugArtifactsNeedRewrite, DEBUG_SERVER_PORT, DEBUG_SERVER_TCL_PORT } from './debug-config.js';
@@ -34,13 +36,14 @@ import { readRunnersFacts } from './runners.js';
 import { bossacTouchReset } from './bossac-touch.js';
 import { ZephyrStrategy } from '../strategy.js';
 import { generateOverlay, type DisplayWiring, type TouchWiring, type OverlayDiagnostic } from '../dt-config/overlay.js';
+import { type KconfigUsage } from '../dt-config/kconfig.js';
 import { generateCustomBoard } from '../dt-config/custom-board.js';
 import { NO_BOARD_CHIP } from '../chips/index.js';
 import { resolveChipFromBoard } from '../chips/resolve.js';
 import type { ZephyrChipDescriptor } from '../chips/types.js';
 import { pwmDtAliasToken } from '../lowering/pwm.js';
 import { detectZephyrVersion, checkZephyrCompat, resolveBoardTarget } from './compat.js';
-import { DEFAULT_ZEPHYR_DISPLAY_PROFILE, profileFromEmittedSource } from '../display/profiles.js';
+import { DEFAULT_ZEPHYR_DISPLAY_PROFILE, profileFromEmittedSource, type ZephyrDisplayProfile } from '../display/profiles.js';
 
 /**
  * Resolve the chip for a build the same way the strategy does at emit time —
@@ -238,7 +241,7 @@ export function scanStrips(src: string): Array<{ index: number; count: number }>
 function scanUsedBusInstances(
   src: string,
   controllers: readonly { nodeLabel: string }[] | undefined,
-  bus: 'i2c' | 'spi' | 'uart',
+  bus: 'i2c' | 'spi' | 'uart' | 'i2s',
 ): number[] | undefined {
   if (!controllers) return undefined;
   const used: number[] = [];
@@ -307,6 +310,146 @@ export function scanSensorParts(src: string): ScannedSensorPart[] {
     }
   }
   return [...out.values()];
+}
+
+/** The transpiler's emit-time shim-dependency declarations — the
+ *  usage-markers.json sidecar stamped beside the emitted sources (the
+ *  lowerings' `markers` at op resolution, the payloads-demo class: helper
+ *  tokens baked into a string payload never appear as code text). The scan
+ *  UNIONS these over its text detection; absent file → empty set (text-only,
+ *  the pre-registry behavior). */
+export function readUsageMarkers(srcDir: string): Set<string> {
+  try {
+    const raw = JSON.parse(readFileSync(join(srcDir, 'usage-markers.json'), 'utf8'));
+    if (raw && Array.isArray(raw.markers)) {
+      return new Set<string>(raw.markers.filter((m: unknown): m is string => typeof m === 'string'));
+    }
+  } catch { /* absent or malformed — text-only fallback */ }
+  return new Set<string>();
+}
+
+/** The emitted-source text both overlay scans read — .cpp/.c AND module
+ *  HEADERS (class methods inline into the headers; a family used only from
+ *  a method leaves its usage markers there — a .cpp-only scan never sees it
+ *  and the overlay/Kconfig synthesis silently skips the node). */
+function readEmittedSource(srcDir: string): string {
+  let src = '';
+  try {
+    for (const name of readdirSync(srcDir)) {
+      if (name.endsWith('.cpp') || name.endsWith('.c') || name.endsWith('.h')) {
+        src += readFileSync(join(srcDir, name), 'utf8');
+      }
+    }
+  } catch { /* src may not exist yet on first prepare */ }
+  return src;
+}
+
+/** The overlay usage scan — the ONE source-derived detection assembly for
+ *  both overlay emissions (prepare's placeholder pass and compile's
+ *  authoritative pass). The two were hand-copied ~35 fields each and
+ *  DRIFTED: prepare missed `usesDac`, compile scanned .cpp only and never
+ *  saw usage markers that live in module headers. A new detection field
+ *  lands here once, never twice. Compile-only inputs (config display/touch
+ *  wiring, the diagnostics sink, psram) ride `extras`; the defaults are the
+ *  prepare-shaped no-op. Pass `extras.touchWiring` AFTER the compile site
+ *  forces its controller so a config-declared XPT2046 reaches the scan. */
+export function scanOverlayUsage(
+  chip: ZephyrChipDescriptor,
+  src: string,
+  extras: {
+    psram?: 'opi' | 'quad';
+    touchWiring?: TouchWiring;
+  } = {},
+  markers: ReadonlySet<string> = new Set(),
+): {
+  usage: KconfigUsage;
+  displayProfile: ZephyrDisplayProfile | undefined;
+  sensorParts: ScannedSensorPart[];
+  spiTargetParts: ScannedSpiTarget[];
+} {
+  // Text detection OR the registry: a capability holds when the lowering
+  // DECLARED its marker at resolution time, even if the token never appears
+  // verbatim in the emitted text.
+  const uses = (t: string): boolean => src.includes(t) || markers.has(t);
+  // Display usage tokens: the minimal GFX runtime (display_write/_fill_rect)
+  // and the UI display adapter (display_init / __tc_display_dev /
+  // DEVICE_DT_GET on the display nodelabel). Both paths need the DT overlay
+  // to enable the display node.
+  const usesDisplay = uses('display_write') || uses('display_init')
+    || uses('display_fill_rect') || uses('__tc_display_dev')
+    || uses('CuttlefishDisplayTarget');
+  // Recover the exact display profile from the marker the adapter stamped
+  // into the emitted source (the registry is the single source of truth).
+  // Fall back to the default profile only when a display is used but no
+  // marker matched (e.g. hand-written source).
+  const displayProfile = usesDisplay
+    ? (profileFromEmittedSource(src) ?? DEFAULT_ZEPHYR_DISPLAY_PROFILE)
+    : undefined;
+  // Touch controller kind for Kconfig (bus driver selection) and the DT node
+  // shape: from the config when available, else from the DT nodelabel the
+  // emitted adapter references.
+  const usesXpt = uses('xpt2046') || extras.touchWiring?.controller === 'xpt2046';
+  const sensorParts = scanSensorParts(src);
+  const spiTargetParts = scanSpiTargets(src);
+  const usage: KconfigUsage = {
+    // __tc_<bus> matches the shim state block — a begin()-only program
+    // emits no driver API call but still declares the DT device. A
+    // constructed sensor is also a bus user (its device handle is the
+    // only i2c reference a sensor-only program carries).
+    usesI2c: uses('i2c_') || uses('__tc_i2c') || sensorParts.length > 0,
+    usesSensor: uses('sensor_') || sensorParts.length > 0,
+    usesFloatFormat: /%[-0-9.*]*[eEfFgG]/.test(src) || src.includes('__tc_toFixed('),
+    sensorParts,
+    spiTargets: spiTargetParts,
+    usesSpi: uses('spi_') || uses('__tc_spi') || spiTargetParts.length > 0,
+    usesUart: uses('__tc_uart'),
+    usesUsb: uses('__tc_usb0'),
+    usesPwm: uses('pwm_'),
+    usesAdc: uses('adc_'),
+    usesThread: uses('k_thread_create'),
+    usesDac: uses('dac_') || uses('__tc_dac'),
+    adcReadPins: scanAdcReadPins(src, chip),
+    dacWritePins: scanDacWritePins(src),
+    pwmUsedPins: scanPwmUsedPins(src, chip),
+    usesStrip: uses('led_strip'),
+    strips: scanStrips(src),
+    usesClock: uses('__tc_rtc'),
+    // __tc_can, not 'can_' — the WiFi scan shim's own identifiers
+    // (scan_count, scan_results) contain 'can_' and would enable the
+    // can@ controller for every WiFi program.
+    usesCan: uses('__tc_can'),
+    canLoopback: uses('CAN_MODE_LOOPBACK'),
+    usesI2s: uses('i2s_'),
+    clockShimCounter: chip.hwtimer && chip.hwtimer.controllers.length > 0
+      ? {
+          label: chip.hwtimer.controllers[0].nodeLabel,
+          ...(chip.hwtimer.controllers[0].counterParent ? { parent: chip.hwtimer.controllers[0].counterParent } : {}),
+        }
+      : undefined,
+    clockShimParentCompatible: chip.hwtimer?.controllers[0]?.compatible,
+    ramKb: chip.ramKb,
+    usesHid: uses('__tc_hid_'),
+    hidProtocol: scanHid(src),
+    usesMatrix: uses('__tc_matrix'),
+    matrix: scanMatrix(src),
+    usesPower: uses('sys_poweroff'),
+    i2cUsedInstances: scanUsedBusInstances(src, chip.i2c?.controllers, 'i2c'),
+    spiUsedInstances: scanUsedBusInstances(src, chip.spi?.controllers, 'spi'),
+    uartUsedInstances: scanUsedBusInstances(src, chip.uart?.controllers, 'uart'),
+    i2sUsedInstances: scanUsedBusInstances(src, chip.i2s?.controllers, 'i2s'),
+    // Preferences/FS — same tokens scaffoldZephyrProject scans (the ZMS
+    // settings_* API + __tc_prefs shim, the __tc_fs mount shim); drive the
+    // storage-partition synthesis + /chosen settings pointer.
+    usesPreferences: uses('settings_') || uses('__tc_prefs'),
+    usesFS: uses('__tc_fs'),
+    usesWdt: uses('wdt_'),
+    usesHwtimer: uses('counter_') || uses('__tc_hw'),
+    usesDisplay,
+    usesTouch: uses('ft6336u') || uses('touch_') || usesXpt,
+    touchController: usesXpt ? 'xpt2046' : 'ft6336u',
+    psram: extras.psram,
+  };
+  return { usage, displayProfile, sensorParts, spiTargetParts };
 }
 
 function targetFromOptions(o: ToolchainOptions): string {
@@ -399,6 +542,85 @@ export function cachedBuildBoard(buildDir: string): string | undefined {
       .match(/^BOARD:STRING=(.+)$/m)?.[1]?.trim() || undefined;
   } catch {
     return undefined; // no build dir / unreadable cache — treat as fresh
+  }
+}
+
+/**
+ * True when every `-DKEY=VALUE` arg already holds that value in the build
+ * dir's CMakeCache.txt. `west build` re-runs the full CMake configure
+ * (~15-20 s) whenever any CMake args follow `--`, even unchanged ones, so
+ * passing them on every build made a no-change rebuild pay for a
+ * reconfigure. An arg that is not `-DKEY=VALUE`, or a missing cache, returns
+ * false (pass them all). Overlay CONTENT changes are still picked up: Zephyr
+ * lists the overlay among CMake's configure dependencies.
+ */
+export function cmakeArgsAlreadyCached(buildDir: string, args: readonly string[]): boolean {
+  if (args.length === 0) return true;
+  let cache: string;
+  try {
+    cache = readFileSync(join(buildDir, 'CMakeCache.txt'), 'utf-8');
+  } catch {
+    return false;
+  }
+  return args.every((arg) => {
+    const m = /^-D([^:=]+)(?::[A-Z]+)?=(.*)$/.exec(arg);
+    if (!m) return false;
+    const [, key, value] = m;
+    const cached = new RegExp(`^${key!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:[A-Z]+=(.*)$`, 'm').exec(cache)?.[1];
+    return cached !== undefined && cached.trim() === value!.trim();
+  });
+}
+
+/**
+ * Flash/RAM use from the linker's region table, which every Zephyr link
+ * prints:
+ *
+ *   Memory region         Used Size  Region Size  %age Used
+ *              FLASH:       17756 B       512 KB      3.39%
+ *                RAM:       11712 B       128 KB      8.94%
+ *
+ * Reads the FLASH and RAM rows by name (the regions every Zephyr linker
+ * script declares); boards whose script names them differently simply get no
+ * summary, same as before. Undefined when the output has no table.
+ */
+export function parseMemoryRegions(output: string): MemoryUsage | undefined {
+  const toBytes = (n: string, unit: string): number => {
+    const scale: Record<string, number> = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 };
+    return Math.round(Number(n) * (scale[unit.toUpperCase()] ?? 1));
+  };
+  const rows = new Map<string, { used: number; total: number }>();
+  const re = /^\s*([A-Za-z0-9_]+):\s+([\d.]+)\s*(B|KB|MB|GB)\s+([\d.]+)\s*(B|KB|MB|GB)\s+[\d.]+%\s*$/gm;
+  for (const m of output.matchAll(re)) {
+    rows.set(m[1]!.toUpperCase(), { used: toBytes(m[2]!, m[3]!), total: toBytes(m[4]!, m[5]!) });
+  }
+  const flash = rows.get('FLASH');
+  const ram = rows.get('RAM') ?? rows.get('SRAM');
+  if (!flash && !ram) return undefined;
+  return {
+    ...(flash ? { flashUsed: flash.used, flashTotal: flash.total } : {}),
+    ...(ram ? { ramUsed: ram.used, ramTotal: ram.total } : {}),
+  };
+}
+
+/**
+ * The memory figures for this build: parsed from the link output when the
+ * build linked, else the figures cached from the last link of the SAME
+ * zephyr.elf (a no-change rebuild does not relink, so prints no table).
+ */
+function memoryUsageForBuild(buildDir: string, output: string): MemoryUsage | undefined {
+  const cachePath = join(buildDir, 'typecad-memory.json');
+  let elfMtime: number | undefined;
+  try { elfMtime = statSync(join(buildDir, 'zephyr', 'zephyr.elf')).mtimeMs; } catch { /* no elf */ }
+  const parsed = parseMemoryRegions(output);
+  if (parsed) {
+    try { writeFileSync(cachePath, JSON.stringify({ elfMtime, usage: parsed })); } catch { /* best-effort */ }
+    return parsed;
+  }
+  try {
+    const cached = JSON.parse(readFileSync(cachePath, 'utf-8')) as { elfMtime?: number; usage?: MemoryUsage };
+    return cached.elfMtime !== undefined && cached.elfMtime === elfMtime ? cached.usage : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -757,6 +979,78 @@ export function isDependencyCycleFailure(output: string): boolean {
   return output.includes('dependency cycle');
 }
 
+/** What spawnStreaming resolves to — the fields of a spawnSync result this
+ *  file reads, so a call site can swap one for the other. */
+export interface StreamedResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * spawnSync's async sibling for long builds: same inputs, same result shape,
+ * but output is handed to `onLine` as it arrives so the caller can render
+ * progress while west/ninja run. Buffers everything, so the returned
+ * stdout/stderr are identical to what spawnSync would have returned.
+ * Honors the timeout in `options` (kills the process tree) and reports a
+ * failed launch (ENOENT, EACCES) through stderr instead of silently.
+ */
+export function spawnStreaming(
+  command: string,
+  args: string[],
+  options: { cwd?: string | URL; env?: NodeJS.ProcessEnv; timeout?: number; windowsHide?: boolean },
+  onLine?: (line: string) => void,
+): Promise<StreamedResult> {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    const pending = { out: '', err: '' };
+    const flush = (which: 'out' | 'err', chunk: string, final = false): void => {
+      if (!onLine) return;
+      pending[which] += chunk;
+      const parts = pending[which].split(/\r?\n|\r/);
+      pending[which] = final ? '' : (parts.pop() ?? '');
+      if (final && parts.length > 0 && parts[parts.length - 1] === '') parts.pop();
+      for (const line of parts) if (line.length > 0) onLine(line);
+    };
+    const finish = (status: number | null): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      flush('out', '', true);
+      flush('err', '', true);
+      resolve({ status, stdout, stderr });
+    };
+
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      windowsHide: options.windowsHide ?? true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const timer = options.timeout
+      ? setTimeout(() => {
+          timedOut = true;
+          stderr += `\n[typecad-hal] timed out after ${Math.round(options.timeout! / 1000)} s — build stopped\n`;
+          if (child.pid !== undefined) killPidTree(child.pid);
+          child.kill();
+        }, options.timeout)
+      : undefined;
+
+    child.stdout?.setEncoding('utf-8');
+    child.stderr?.setEncoding('utf-8');
+    child.stdout?.on('data', (d: string) => { stdout += d; flush('out', d); });
+    child.stderr?.on('data', (d: string) => { stderr += d; flush('err', d); });
+    child.on('error', (err) => {
+      stderr += `${err.message}\n`;
+      finish(null);
+    });
+    child.on('close', (code) => finish(timedOut ? null : code));
+  });
+}
+
 /** stdout+stderr of a spawnSync result coerced to one string. Defensive about
  *  the buffer form (spawnSync only returns strings when `encoding` is set,
  *  which every call site here does — but the coercion costs nothing). */
@@ -783,91 +1077,16 @@ export const Toolchain = {
     const projectRoot = basename(outputDir) === 'src' ? dirname(outputDir) : outputDir;
     // Scan the emitted source for usage tokens (same authoritative signal the
     // scaffold uses). entryPoint is the path to main.cpp; its dir is src/.
-    const srcDir = dirname(entryPoint);
-    let src = '';
-    try {
-      for (const name of readdirSync(srcDir)) {
-        if (name.endsWith('.cpp') || name.endsWith('.c')) {
-          src += readFileSync(join(srcDir, name), 'utf8');
-        }
-      }
-    } catch { /* src may not exist yet on first prepare */ }
-    const uses = (t: string): boolean => src.includes(t);
+    const src = readEmittedSource(dirname(entryPoint));
+    const usageMarkers = readUsageMarkers(dirname(entryPoint));
     // Inline-override markers (the escape hatch): the lowerings emit
     // `cuttlefish-user-facts` comments carrying routing the transpiler
     // cannot synthesize (adc device/pinctrl, pwm controller/channel).
     // Merged into the chip BEFORE the scans + overlay generation, so the DT
     // nodes, pinctrl groups, and used-pin recovery treat them as facts.
     const chip = applyUserFactMarkers(chipForBuild(projectRoot, ''), src);
-    // Display usage tokens: the minimal GFX runtime (display_write/_fill_rect)
-    // and the UI display adapter (display_init / __tc_display_dev /
-    // DEVICE_DT_GET on the display nodelabel). Both paths need the DT overlay
-    // to enable the display node.
-    const usesDisplay = uses('display_write') || uses('display_init')
-      || uses('display_fill_rect') || uses('__tc_display_dev')
-      || uses('CuttlefishDisplayTarget');
-    // Recover the exact display profile from the marker the adapter stamped
-    // into the emitted source (the registry is the single source of truth).
-    // Fall back to the default profile only when a display is used but no
-    // marker matched (e.g. hand-written source).
-    const displayProfile = usesDisplay
-      ? (profileFromEmittedSource(src) ?? DEFAULT_ZEPHYR_DISPLAY_PROFILE)
-      : undefined;
-    // Touch controller kind comes from which DT nodelabel the emitted adapter
-    // references (FT6336U on I2C, XPT2046 on the display's SPI bus).
-    const usesTouch = uses('ft6336u') || uses('touch_');
-    const usesXpt = uses('xpt2046');
-    const sensorParts = scanSensorParts(src);
-    const spiTargetParts = scanSpiTargets(src);
-    const overlay = generateOverlay(chip, {
-      // __tc_<bus> matches the shim state block — a begin()-only program
-      // emits no driver API call but still declares the DT device. A
-      // constructed sensor is also a bus user (its device handle is the
-      // only i2c reference a sensor-only program carries).
-      usesI2c: uses('i2c_') || uses('__tc_i2c') || sensorParts.length > 0,
-      usesSensor: uses('sensor_') || sensorParts.length > 0,
-      usesFloatFormat: /%[-0-9.]*[eEfFgG]/.test(src),
-      sensorParts,
-      spiTargets: spiTargetParts,
-      usesSpi: uses('spi_') || uses('__tc_spi') || spiTargetParts.length > 0,
-      usesUart: uses('__tc_uart'),
-      usesUsb: uses('__tc_usb0'),
-      usesPwm: uses('pwm_'),
-      usesAdc: uses('adc_'),
-      adcReadPins: scanAdcReadPins(src, chip),
-      dacWritePins: scanDacWritePins(src),
-      pwmUsedPins: scanPwmUsedPins(src, chip),
-      usesStrip: uses('led_strip'),
-      strips: scanStrips(src),
-      usesClock: uses('__tc_rtc'),
-      usesCan: uses('can_'),
-      canLoopback: uses('CAN_MODE_LOOPBACK'),
-      usesI2s: uses('i2s_'),
-      clockShimCounter: chip.hwtimer && chip.hwtimer.controllers.length > 0
-        ? {
-            label: chip.hwtimer.controllers[0].nodeLabel,
-            ...(chip.hwtimer.controllers[0].counterParent ? { parent: chip.hwtimer.controllers[0].counterParent } : {}),
-          }
-        : undefined,
-      usesHid: uses('__tc_hid_'),
-      hidProtocol: scanHid(src),
-      usesMatrix: uses('__tc_matrix'),
-      matrix: scanMatrix(src),
-      usesPower: uses('sys_poweroff'),
-      i2cUsedInstances: scanUsedBusInstances(src, chip.i2c?.controllers, 'i2c'),
-      spiUsedInstances: scanUsedBusInstances(src, chip.spi?.controllers, 'spi'),
-      uartUsedInstances: scanUsedBusInstances(src, chip.uart?.controllers, 'uart'),
-      // Preferences/FS — same tokens scaffoldZephyrProject scans (the ZMS
-      // settings_* API + __tc_prefs shim, the __tc_fs mount shim); drive the
-      // storage-partition synthesis + /chosen settings pointer.
-      usesPreferences: uses('settings_') || uses('__tc_prefs'),
-      usesFS: uses('__tc_fs'),
-      usesWdt: uses('wdt_'),
-      usesHwtimer: uses('counter_') || uses('__tc_hw'),
-      usesDisplay,
-      usesTouch: usesTouch || usesXpt,
-      touchController: usesXpt ? 'xpt2046' : 'ft6336u',
-    }, displayProfile);
+    const { usage, displayProfile, spiTargetParts } = scanOverlayUsage(chip, src, {}, usageMarkers);
+    const overlay = generateOverlay(chip, usage, displayProfile);
     const overlayDir = join(projectRoot, 'boards');
     mkdirSync(overlayDir, { recursive: true });
     // prepare() runs before the real target is known — the placeholder name
@@ -895,7 +1114,7 @@ export const Toolchain = {
     }
   },
 
-  compile(o: ToolchainOptions): CompileResult {
+  async compile(o: ToolchainOptions): Promise<CompileResult> {
     const projectRoot = projectRootFromOptions(o);
     const rawBoard = targetFromOptions(o);
 
@@ -909,13 +1128,26 @@ export const Toolchain = {
     if (compat.status === 'out-of-range') {
       throw new Error(
         `Zephyr ${zephyrVersion} is outside the supported range (${compat.range}) for @typecad/framework-zephyr. ` +
-        `Set ZEPHYR_BASE to a compatible Zephyr checkout, or install one via '@typecad/zephyr-installer'.`,
+        `Set ZEPHYR_BASE to a compatible Zephyr checkout, or install the supported one by running:\n\n` +
+        `${commandBlock(ZEPHYR_INSTALL_CMD)}`,
+      );
+    }
+    // An explicit ZEPHYR_BASE that isn't a Zephyr tree is a mistake to stop
+    // on, not to warn past: an existing build dir would otherwise keep
+    // compiling against the tree it cached, so the user's setting silently
+    // had no effect (and a fresh build fails deep inside CMake instead).
+    const zb = process.env.ZEPHYR_BASE;
+    if (zb && !locateZephyrBaseCheap()) {
+      throw new Error(
+        `ZEPHYR_BASE is set to '${zb}', which isn't a Zephyr tree (no CMakeLists.txt and include/zephyr/kernel.h there).\n\n` +
+        `Point it at your Zephyr checkout (e.g. ~/zephyrproject/zephyr), ` +
+        `or unset it to use the auto-detected tree.`,
       );
     }
     if (compat.status === 'undetectable') {
       console.warn(
-        `! Could not detect the installed Zephyr version (is ZEPHYR_BASE set?). ` +
-        `Skipping compat check; declared range is ${compat.range}.`,
+        `! Could not find a Zephyr tree to read its version from. ` +
+        `Skipping the version check (supported: ${compat.range}).`,
       );
     }
     const board = resolveBoardTarget(rawBoard, zephyrVersion);
@@ -925,14 +1157,27 @@ export const Toolchain = {
     const zc = o.zephyrConfig as Record<string, unknown> | undefined;
     const userKconfig = zc?.kconfig as Record<string, string> | undefined;
     const traceCfg = zc?.trace as { enabled?: boolean; intervalMs?: number } | undefined;
-    const configChanged = scaffoldZephyrProject(projectRoot, isGdbDebug, userKconfig, o.psram, traceCfg);
+    // The chip resolves from the board catalog BEFORE the scaffold so the
+    // prj.conf can carry chip-fact Kconfig (the Clock shim's RTC-class
+    // parent driver — its Kconfig default flips off when Counter is also
+    // used, and prj.conf must force it back on before west reads it).
+    const chipPre = chipForBuild(projectRoot, board);
+    const configChanged = scaffoldZephyrProject(
+      projectRoot,
+      isGdbDebug,
+      userKconfig,
+      o.psram,
+      traceCfg,
+      chipPre?.hwtimer?.controllers[0]?.compatible,
+      chipPre?.ramKb,
+    );
 
     // Regenerate the DT overlay for the ACTUAL target board. prepare() writes
     // it for the default board (the real target is unknown until compile), so
     // the <default>.overlay it wrote does not match `west build -b <board>`.
     // Zephyr auto-detects boards/<board>.overlay under APPLICATION_CONFIG_DIR.
     try {
-      const chip = chipForBuild(projectRoot, board);
+      const chip = chipPre;
       // Custom-board generation: an MCU-only target (no board package) has no
       // upstream Zephyr board — generate one under boards/typecad/<name>/ from
       // the chip's silicon data. Opt-in via `zephyr.customBoard: true` in
@@ -948,29 +1193,11 @@ export const Toolchain = {
           );
         }
       }
-      const srcDir = join(projectRoot, 'src');
-      let src = '';
-      try {
-        for (const name of readdirSync(srcDir)) {
-          if (name.endsWith('.cpp') || name.endsWith('.c')) {
-            src += readFileSync(join(srcDir, name), 'utf-8');
-          }
-        }
-      } catch { /* src may not exist */ }
-      const uses = (t: string): boolean => src.includes(t);
-      const usesDisplay = uses('display_write') || uses('display_init')
-        || uses('display_fill_rect') || uses('__tc_display_dev')
-        || uses('CuttlefishDisplayTarget');
-      // Recover the exact display profile from the marker the adapter emitted
-      // (`typecad-display-profile: <driver>`), so the DT overlay's compatible
-      // string, geometry, and rotation match the panel the adapter targets.
-      // The width/height regex this replaces could produce franken-profiles —
-      // e.g. an ST7796S build (480x320) on the default ILI9341 profile's
-      // controller/compatible, which emitted an ilitek,ili9341 DT node for a
-      // panel the ST7796S adapter drives.
-      const displayProfile = usesDisplay
-        ? (profileFromEmittedSource(src) ?? DEFAULT_ZEPHYR_DISPLAY_PROFILE)
-        : undefined;
+      // The shared usage scan (headers included — class methods inline into
+      // the module headers, and a family used only from a method leaves its
+      // usage markers there). displayProfile comes out of the scan.
+      const src = readEmittedSource(join(projectRoot, 'src'));
+      const usageMarkers = readUsageMarkers(join(projectRoot, 'src'));
       // Extract display pin wiring (cs/dc/rst/spiFrequency/spiPins) from the
       // config display section so the DT overlay wires the MIPI DBI bridge to
       // the correct GPIOs + SPI bus pins.
@@ -1027,63 +1254,19 @@ export const Toolchain = {
       // Touch controller kind for Kconfig (bus driver selection) and the DT
       // node shape: from the config when available, else from the DT nodelabel
       // the emitted adapter references. Forced onto touchWiring so a source
-      // scan match without a config section still emits the right node.
-      const usesXpt = isXpt || uses('xpt2046');
-      if (usesXpt) {
+      // scan match without a config section still emits the right node; the
+      // forced value also feeds the shared scan below.
+      if (isXpt || src.includes('xpt2046')) {
         touchWiring = { controller: 'xpt2046', ...(touchWiring ?? {}) };
       }
-      const overlayDiagnostics: OverlayDiagnostic[] = [];
-      const sensorParts = scanSensorParts(src);
-      const spiTargetParts = scanSpiTargets(src);
-      const overlay = generateOverlay(chip, {
-        // __tc_<bus> matches the shim state block — a begin()-only program
-        // emits no driver API call but still declares the DT device. A
-        // constructed sensor is also a bus user (see scanSensorParts).
-        usesI2c: uses('i2c_') || uses('__tc_i2c') || sensorParts.length > 0,
-        usesSensor: uses('sensor_') || sensorParts.length > 0,
-        usesFloatFormat: /%[-0-9.]*[eEfFgG]/.test(src),
-        sensorParts,
-        spiTargets: spiTargetParts,
-        usesSpi: uses('spi_') || uses('__tc_spi') || spiTargetParts.length > 0,
-        usesUart: uses('__tc_uart'),
-        usesUsb: uses('__tc_usb0'),
-        usesPwm: uses('pwm_'),
-        usesAdc: uses('adc_'),
-        adcReadPins: scanAdcReadPins(src, chip),
-        usesDac: uses('dac_') || uses('__tc_dac'),
-        dacWritePins: scanDacWritePins(src),
-        pwmUsedPins: scanPwmUsedPins(src, chip),
-      usesStrip: uses('led_strip'),
-      strips: scanStrips(src),
-      usesHid: uses('__tc_hid_'),
-      hidProtocol: scanHid(src),
-      usesMatrix: uses('__tc_matrix'),
-      matrix: scanMatrix(src),
-      usesPower: uses('sys_poweroff'),
-      usesClock: uses('__tc_rtc'),
-      usesCan: uses('can_'),
-      canLoopback: uses('CAN_MODE_LOOPBACK'),
-      usesI2s: uses('i2s_'),
-      clockShimCounter: chip.hwtimer && chip.hwtimer.controllers.length > 0
-        ? {
-            label: chip.hwtimer.controllers[0].nodeLabel,
-            ...(chip.hwtimer.controllers[0].counterParent ? { parent: chip.hwtimer.controllers[0].counterParent } : {}),
-          }
-        : undefined,
-        i2cUsedInstances: scanUsedBusInstances(src, chip.i2c?.controllers, 'i2c'),
-        spiUsedInstances: scanUsedBusInstances(src, chip.spi?.controllers, 'spi'),
-        uartUsedInstances: scanUsedBusInstances(src, chip.uart?.controllers, 'uart'),
-        // Preferences/FS — same tokens scaffoldZephyrProject scans; drive the
-        // storage-partition synthesis + /chosen settings pointer.
-        usesPreferences: uses('settings_') || uses('__tc_prefs'),
-        usesWdt: uses('wdt_'),
-        usesHwtimer: uses('counter_') || uses('__tc_hw'),
-        usesFS: uses('__tc_fs'),
-        usesDisplay,
-        usesTouch: uses('ft6336u') || uses('touch_') || usesXpt,
-        touchController: usesXpt ? 'xpt2046' : 'ft6336u',
+      // The ONE usage scan (see scanOverlayUsage) — the authoritative pass
+      // feeds it the compile-only inputs.
+      const { usage, displayProfile, spiTargetParts } = scanOverlayUsage(chip, src, {
         psram: o.psram,
-      }, displayProfile, wiring, touchWiring, overlayDiagnostics);
+        touchWiring,
+      }, usageMarkers);
+      const overlayDiagnostics: OverlayDiagnostic[] = [];
+      const overlay = generateOverlay(chip, usage, displayProfile, wiring, touchWiring, overlayDiagnostics);
       for (const d of overlayDiagnostics) {
         console.warn(`overlay: ${d.message}`);
       }
@@ -1149,6 +1332,7 @@ export const Toolchain = {
     }
 
     const buildArgs = ['build', '-b', board, '-d', buildDir, projectRoot];
+    const cmakeArgs: string[] = [];
     // Explicitly pass the generated DT overlay. Zephyr's auto-detection of
     // boards/<board>.overlay fails for hardware-qualified targets (e.g.
     // esp32_devkitc/esp32/procpu) because the FILE_SUFFIX matching doesn't
@@ -1159,20 +1343,24 @@ export const Toolchain = {
       if (readFileSync(overlayPath, 'utf-8').length > 0) {
         // CMake parses backslashes as escapes — use forward slashes so the
         // Windows path survives the -D argument intact.
-        buildArgs.push('--', `-DDTC_OVERLAY_FILE=${overlayPath.replace(/\\/g, '/')}`);
+        cmakeArgs.push(`-DDTC_OVERLAY_FILE=${overlayPath.replace(/\\/g, '/')}`);
       }
     } catch { /* no overlay — let Zephyr auto-detect or build without one */ }
     // Append user cmake args from typecad-hal.config.ts zephyr.cmakeArgs.
     const userCmakeArgs = zc?.cmakeArgs as string[] | undefined;
     if (userCmakeArgs && userCmakeArgs.length > 0) {
-      if (!buildArgs.includes('--')) buildArgs.push('--');
-      buildArgs.push(...userCmakeArgs);
+      cmakeArgs.push(...userCmakeArgs);
+    }
+    // Only hand west the CMake args when the cached build doesn't already
+    // hold them: any args after `--` force a full reconfigure.
+    if (cmakeArgs.length > 0 && !cmakeArgsAlreadyCached(buildDir, cmakeArgs)) {
+      buildArgs.push('--', ...cmakeArgs);
     }
     const inv = westSpawn(
       buildArgs,
       { cwd: projectRoot, encoding: 'utf-8', timeout: BUILD_TIMEOUT_MS },
     );
-    let result = spawnSync(inv.command, inv.args, inv.options);
+    let result = await spawnStreaming(inv.command, inv.args, inv.options, o.onOutput);
     // Self-heal the Zephyr 4.3.99 dep-cycle regression (see the nuke comment
     // above): when the cached .ninja_deps carries the cycle, ninja aborts with
     // `dependency cycle` before compiling anything. The cycle lives in the
@@ -1181,13 +1369,12 @@ export const Toolchain = {
     let pristineRetry = false;
     if (result.status !== 0 && isDependencyCycleFailure(combinedSpawnOutput(result))) {
       try { rmSync(buildDir, { recursive: true, force: true }); } catch { /* may not exist */ }
-      result = spawnSync(inv.command, inv.args, inv.options);
+      result = await spawnStreaming(inv.command, inv.args, inv.options, o.onOutput);
       pristineRetry = true;
     }
 
-    const stdout = typeof result.stdout === 'string' ? result.stdout : (result.stdout?.toString() ?? '');
-    const stderr = typeof result.stderr === 'string' ? result.stderr : (result.stderr?.toString() ?? '');
-    const output = stdout + stderr + (pristineRetry
+    // spawnStreaming always resolves strings (it sets the stream encoding).
+    const output = result.stdout + result.stderr + (pristineRetry
       ? '\n[typecad-hal] dependency cycle detected in the cached build dir — retried with a pristine build'
       : '');
     // Prefix the build log with how west was resolved, for transparency.
@@ -1264,10 +1451,20 @@ export const Toolchain = {
       } catch { /* best-effort SBOM stamp */ }
     }
 
+    const memoryUsage = result.status === 0 ? memoryUsageForBuild(buildDir, output) : undefined;
+    // The flashable outputs Zephyr wrote (which ones depends on the board's
+    // Kconfig: uf2 for UF2 bootloaders, hex/bin elsewhere; elf always).
+    const artifacts = result.status === 0
+      ? ['zephyr.elf', 'zephyr.hex', 'zephyr.bin', 'zephyr.uf2']
+          .map((f) => join(buildDir, 'zephyr', f))
+          .filter((f) => existsSync(f))
+      : [];
     return {
       success: result.status === 0,
       output: header + output,
       errors: parseCompileErrors(output, o.sourcePath),
+      ...(memoryUsage ? { memoryUsage } : {}),
+      ...(artifacts.length > 0 ? { artifacts } : {}),
     };
   },
 
@@ -1510,7 +1707,7 @@ export const Toolchain = {
     // VS Code background task owns this process; postDebugTask runs `stop`).
     if (!existsSync(join(buildDir, 'zephyr', 'runners.yaml'))) {
       console.error(
-        `! No build at ${buildDir} — run 'npm run compile' (or F5's preLaunchTask) first.`,
+        `! No build at ${buildDir}. Build the project first (or use F5's preLaunchTask):\n\n${commandBlock('npm run compile')}\n`,
       );
       process.exitCode = 1;
       return;

@@ -57,7 +57,7 @@ export function httpInitLines(): string[] {
     `// Single-slot request/response state. scheme/host/port/path are parsed`,
     `// from the url at perform time and drive the socket family + TLS choice.`,
     `// ca_cert is user-owned PEM; insecure skips peer verification entirely.`,
-    `static struct {`,
+    `struct __tc_http_state {`,
     `    char url[512];`,
     `    char scheme[8];          // "http" or "https"`,
     `    char host[128];`,
@@ -113,7 +113,8 @@ export function httpInitLines(): string[] {
     `    bool sem_inited;`,
     `    struct k_work perform_work;`,
     `    bool work_inited;`,
-    `} __tc_http;`,
+    `}; struct __tc_http_state __tc_http __attribute__((weak));  // NAMED state type: anonymous-struct variables internalize even under weak (see mqtt).`,
+
     ``,
     `// ── URL parser ──────────────────────────────────────────────────────────`,
     `// Splits "scheme://host[:port]/path" into the struct fields. http→80,`,
@@ -329,9 +330,9 @@ export function httpInitLines(): string[] {
     `                        __tc_http.ca_added_len = __tc_http.ca_der_len;`,
     `                        __tc_http.ca_added_set = true;`,
     `                        sec_tag_t tags[1] = { __TC_HTTP_SEC_TAG };`,
-    `                        (void)zsock_setsockopt(sock_tls, SOL_TLS, TLS_SEC_TAG_LIST, tags, sizeof(tags));`,
+    `                        int tagrc = zsock_setsockopt(sock_tls, SOL_TLS, TLS_SEC_TAG_LIST, tags, sizeof(tags));`,
+    `                        if (tagrc != 0) printk("tc-http: TAG_LIST rc=%d errno=%d\\n", tagrc, errno);`,
     `                    } else if (cred_rc == -17 /* -EEXIST */) {`,
-    `                        printk("tc-http: sec tag %d already holds a CA; the first one stays active (add rc=%d)\\n", __TC_HTTP_SEC_TAG, cred_rc);`,
     `                        __tc_http.ca_added = __tc_http.ca_der;`,
     `                        __tc_http.ca_added_len = __tc_http.ca_der_len;`,
     `                        __tc_http.ca_added_set = true;`,
@@ -348,13 +349,16 @@ export function httpInitLines(): string[] {
     `            // Hostname SNI + verification. insecure() disables verification;`,
     `            // the default (no caCert, no insecure) leaves verification required`,
     `            // with no sec tag, so the handshake fails safely until a CA is set.`,
-    `            // mbedtls does not match IP literals against SAN entries —`,
-    `            // skip the hostname check for IP hosts (chain-only verify).`,
-    `            if (!__tc_http_host_is_ipv4(__tc_http.host)) {`,
-    `                (void)zsock_setsockopt(sock_tls, SOL_TLS, TLS_HOSTNAME, __tc_http.host, strlen(__tc_http.host) + 1U);`,
-    `            }`,
+    `            // TLS_HOSTNAME is set for DNS hosts AND IP literals: mbedtls 3.x`,
+    `            // matches IP literals against SAN iPAddress entries`,
+    `            // (x509_crt_check_san_ip), and an UNSET hostname fails the SAN/CN`,
+    `            // check outright (BADCERT_CN_MISMATCH 0x04 — the hardware bench`,
+    `            // proved it: every pinned-CA handshake died with flags=0x04 while`,
+    `            // insecure() passed).`,
+    `            (void)zsock_setsockopt(sock_tls, SOL_TLS, TLS_HOSTNAME, __tc_http.host, strlen(__tc_http.host) + 1U);`,
     `            int32_t verify = __tc_http.insecure ? TLS_PEER_VERIFY_NONE : TLS_PEER_VERIFY_REQUIRED;`,
-    `            (void)zsock_setsockopt(sock_tls, SOL_TLS, TLS_PEER_VERIFY, &verify, sizeof(verify));`,
+    `            int vrc = zsock_setsockopt(sock_tls, SOL_TLS, TLS_PEER_VERIFY, &verify, sizeof(verify));`,
+    `            if (vrc != 0) printk("tc-http: PEER_VERIFY rc=%d errno=%d\\n", vrc, errno);`,
     `        }`,
     `        sock = sock_tls;`,
     `#else`,
@@ -370,10 +374,11 @@ export function httpInitLines(): string[] {
     `        return -1;`,
     `    }`,
     `    int cret = zsock_connect(sock, res->ai_addr, res->ai_addrlen);`,
+    `    int cerr = errno;`,
     `    zsock_freeaddrinfo(res);`,
     `    if (cret < 0) {`,
-    `        printk("tc-http: connect(%s:%u) failed (errno=%d)\\n", __tc_http.host,`,
-    `               static_cast<unsigned int>(__tc_http.port), -cret);`,
+    `        printk("tc-http: connect(%s:%u) failed (cret=%d errno=%d)\\n", __tc_http.host,`,
+    `               static_cast<unsigned int>(__tc_http.port), cret, cerr);`,
     `        zsock_close(sock);`,
     `        return -1;`,
     `    }`,
@@ -470,6 +475,13 @@ export function httpInitLines(): string[] {
     `    __tc_http.body_len = (data != nullptr) ? static_cast<int32_t>(strlen(data)) : 0;`,
     `    if (json) __tc_http_set_header("Content-Type", "application/json");`,
     `}`,
+    // Named string consts (const std::string URL = "...") bind here —
+    // the char* forms stay for literals (the __tc_wifi_str precedent).
+    `static inline void __tc_http_begin(enum http_method method, const std::string& url) { __tc_http_begin(method, url.c_str()); }`,
+    `static inline void __tc_http_set_header(const std::string& name, const std::string& value) { __tc_http_set_header(name.c_str(), value.c_str()); }`,
+    `static inline void __tc_http_set_header(const char* name, const std::string& value) { __tc_http_set_header(name, value.c_str()); }`,
+    `static inline void __tc_http_set_header(const std::string& name, const char* value) { __tc_http_set_header(name.c_str(), value); }`,
+    `static inline void __tc_http_set_body(const std::string& data, bool json) { __tc_http_set_body(data.c_str(), json); }`,
     ``,
     `static inline void __tc_http_set_insecure(void) { __tc_http.insecure = true; }`,
     ``,
@@ -742,3 +754,17 @@ export function lowerHttp(op: HALOpIR): { code?: string; expression?: string } {
       throw new Error(`framework-zephyr does not yet support HAL op \`${op.operation}\`.`);
   }
 }
+
+
+// ── Op C++ return types (the single definition site) ─────────────────────
+// Beside the lowering cases that emit them; served to the engine via the
+// strategy's halOpCppType seam (see wifi.ts for the contract).
+export const OP_CPP_RETURN_TYPES: Readonly<Record<string, string>> = {
+  'http.body': 'const char*',
+  'http.response_header': 'const char*',
+  'http.ok': 'bool',
+  'http.done': 'bool',
+  'http.send': 'bool',
+  'http.status': 'int32_t',
+  'http.content_length': 'int32_t',
+};

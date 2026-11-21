@@ -97,12 +97,15 @@ export function transportFor(
 }
 
 /** Resolve a profile's mipi-dbi host. Clone-ST77xx panels need the local
- *  CS-holding host; everything else defaults to the stock SPI bridge. */
+ *  CS-holding host; everything else defaults to the stock SPI bridge. The
+ *  controller resolution flows through ONE seam (panelControllerFor) so a
+ *  drop-in compatible spelling ('sitronix,st7796s') lands where the
+ *  registry-profile spelling ('st7796-zephyr') does. */
 export function dbiHostFor(
-  profile: Pick<ZephyrDisplayProfile, 'dbiHost' | 'controller'>,
+  profile: Pick<ZephyrDisplayProfile, 'dbiHost' | 'controller' | 'driver'>,
 ): ZephyrDbiHost {
   if (profile.dbiHost) return profile.dbiHost;
-  return profile.controller === 'st7796s' ? 'local-hold-cs' : 'spi-bridge';
+  return panelControllerFor(profile) === 'st7796s' ? 'local-hold-cs' : 'spi-bridge';
 }
 
 /** Marker the display adapters stamp into the emitted source so the toolchain
@@ -187,18 +190,26 @@ export const PANEL_CONTROLLER_DEFAULTS: Record<
 
 /** Resolve a profile's panel controller, inferring it from the driver id when
  *  the profile doesn't declare one (the '<controller>-zephyr' naming scheme).
- *  Synthesized (compatible-driven) profiles carry no controller — undefined
- *  routes them to the binding-driven generic paths. */
+ *  Synthesized (compatible-driven) profiles carry no controller — their driver
+ *  is the full DT compatible (`sitronix,st7796s`), so the COMPATIBLE TAIL is
+ *  what the table matches; keying on the bare prefix missed every drop-in
+ *  spelling and routed st7796s local-hold-cs builds to the generic
+ *  CONFIG_MIPI_DBI_SPI=y branch — the in-tree bridge driver then instantiated
+ *  on the same mipi_dbi node the app-local host defines (multiple definition
+ *  of __device_dts_ord_N at link; zephyr-ui, cold builds). */
 export function panelControllerFor(
   profile: Pick<ZephyrDisplayProfile, 'driver' | 'controller'>,
 ): ZephyrPanelController | undefined {
   if (profile.controller) return profile.controller;
-  if (profile.driver.startsWith('ili9341')) return 'ili9341';
-  if (profile.driver.startsWith('st7796')) return 'st7796s';
+  const tail = profile.driver.includes(',')
+    ? (profile.driver.split(',').pop() ?? profile.driver)
+    : profile.driver;
+  if (tail.startsWith('ili9341')) return 'ili9341';
+  if (tail.startsWith('st7796')) return 'st7796s';
   // E-ink families (drop-in compatibles): the driver symbol the Kconfig
   // layer enables under the mipi-dbi SPI branch.
-  if (profile.driver.startsWith('solomon,ssd16')) return 'ssd16xx';
-  if (profile.driver.startsWith('ultrachip,uc81')) return 'uc81xx';
+  if (tail.startsWith('ssd16')) return 'ssd16xx';
+  if (tail.startsWith('uc8')) return 'uc81xx';
   return undefined;
 }
 

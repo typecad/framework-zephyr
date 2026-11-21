@@ -23,6 +23,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { activeBoardCatalog, lookupBoardTarget, ZEPHYR_INSTALL_CMD, type BoardDataEntry } from '@typecad/cuttlefish/board-catalog';
 import { type WestInstall, discoverWest } from './west-discover.js';
 import { westSpawn } from './west-spawn.js';
 import {
@@ -59,6 +60,13 @@ export interface CheckZephyrEnvOptions {
   fakeWestProbe?: WestProbeData;
   /** FOR TESTS ONLY: override the board-existence lookup. */
   fakeBoardExists?: (boardId: string, zephyrBase: string | undefined) => boolean | undefined;
+  /**
+   * The board catalog to check the target against (defaults to the active
+   * catalog). When it has entries it is authoritative — it knows every
+   * qualified board/soc target and can suggest a close one; the boards/
+   * directory scan is the fallback when there is no catalog.
+   */
+  boardCatalog?: Readonly<Record<string, BoardDataEntry>>;
 }
 
 // ---- result types ------------------------------------------------------------
@@ -84,13 +92,17 @@ export interface ZephyrEnvCheck {
   resolvedBoardTarget: string | undefined;
   /** Does the resolved board exist in the checkout? undefined = undetermined. */
   boardTargetSupported: boolean | undefined;
+  /** Closest known target when the board wasn't found (catalog lookups only). */
+  boardSuggestion?: string;
+  /** The catalog entry for the board, when the catalog knew it. */
+  boardEntry?: BoardDataEntry;
 }
 
 export type ZephyrEnvOk = { ok: true; check: ZephyrEnvCheck };
 
 export type ZephyrEnvFailure = {
   ok: false;
-  reason: 'west-not-found' | 'zephyr-out-of-range' | 'board-not-supported';
+  reason: 'west-not-found' | 'zephyr-not-found' | 'zephyr-out-of-range' | 'board-not-supported';
   check: ZephyrEnvCheck;
   /** Human-readable lines ready to print. */
   messages: string[];
@@ -207,14 +219,33 @@ export function checkZephyrEnv(
   options?: CheckZephyrEnvOptions,
 ): ZephyrEnvResult {
   const probe = options?.fakeWestProbe ?? probeWestEnv();
-  const boardLookup = options?.fakeBoardExists ?? boardExistsInCheckout;
 
   const zephyrVersion = detectZephyrVersion();
   const compat = checkZephyrCompat(zephyrVersion);
   const resolvedBoardTarget = buildTarget ? resolveBoardTarget(buildTarget, zephyrVersion) : undefined;
-  const boardId = resolvedBoardTarget ? resolvedBoardTarget.split('/')[0]! : undefined;
-  const boardTargetSupported =
-    boardId !== undefined ? boardLookup(boardId, probe.zephyrBase) : undefined;
+  // The board directory is named without a revision: nrf9160dk@0.14.0 lives
+  // in boards/<vendor>/nrf9160dk/.
+  const boardId = resolvedBoardTarget ? resolvedBoardTarget.split('/')[0]!.split('@')[0]! : undefined;
+
+  let boardTargetSupported: boolean | undefined;
+  let boardSuggestion: string | undefined;
+  let boardEntry: BoardDataEntry | undefined;
+  if (resolvedBoardTarget !== undefined && boardId !== undefined) {
+    if (options?.fakeBoardExists) {
+      boardTargetSupported = options.fakeBoardExists(boardId, probe.zephyrBase);
+    } else {
+      let catalog: Readonly<Record<string, BoardDataEntry>> = {};
+      try { catalog = options?.boardCatalog ?? activeBoardCatalog(); } catch { /* no catalog */ }
+      const verdict = lookupBoardTarget(catalog, resolvedBoardTarget);
+      if (verdict) {
+        boardTargetSupported = verdict.found;
+        if (verdict.found) boardEntry = verdict.entry;
+        else boardSuggestion = verdict.suggestion;
+      } else {
+        boardTargetSupported = boardExistsInCheckout(boardId, probe.zephyrBase);
+      }
+    }
+  }
 
   const check: ZephyrEnvCheck = {
     westFound: probe.westFound,
@@ -227,6 +258,8 @@ export function checkZephyrEnv(
     buildTarget,
     resolvedBoardTarget,
     boardTargetSupported,
+    ...(boardSuggestion ? { boardSuggestion } : {}),
+    ...(boardEntry ? { boardEntry } : {}),
   };
 
   // 1. west (the build tool) missing entirely — nothing else can run.
@@ -236,30 +269,47 @@ export function checkZephyrEnv(
       reason: 'west-not-found',
       check,
       messages: [
-        "west (the Zephyr build tool) was not found.",
-        "  Run the typeCAD Zephyr installer, activate an existing Zephyr venv,",
-        "  set ZEPHYR_BASE to a Zephyr SDK root, or `pip install west`.",
+        "west (the Zephyr build tool) was not found. Install the pinned Zephyr setup",
+        "(it includes west), or activate an existing Zephyr environment in this shell.",
       ],
-      fixCommand: undefined,
+      fixCommand: ZEPHYR_INSTALL_CMD,
     };
   }
 
-  // 2. west healthy but the Zephyr RTOS is outside the supported range.
+  // 2. No readable Zephyr tree — nothing can build. (Not a soft skip: a
+  // project with no tree cannot compile, so "Environment OK" would be false.)
+  if (compat.status === 'undetectable') {
+    const envBase = process.env.ZEPHYR_BASE;
+    return {
+      ok: false,
+      reason: 'zephyr-not-found',
+      check,
+      messages: [
+        envBase
+          ? `ZEPHYR_BASE is set to ${envBase}, but that folder isn't a Zephyr tree (no VERSION file). ` +
+            `Point ZEPHYR_BASE at your zephyr/ folder, or unset it to use the installed one.`
+          : 'No Zephyr tree was found. Install the pinned Zephyr setup, or set ZEPHYR_BASE to your zephyr/ folder.',
+      ],
+      fixCommand: envBase ? undefined : ZEPHYR_INSTALL_CMD,
+    };
+  }
+
+  // 3. west healthy but the Zephyr RTOS is outside the supported range.
   if (compat.status === 'out-of-range') {
     return {
       ok: false,
       reason: 'zephyr-out-of-range',
       check,
       messages: [
-        `Zephyr ${zephyrVersion} is outside the supported range (${compat.range}) for @typecad/framework-zephyr.`,
-        "  Set ZEPHYR_BASE to a compatible Zephyr checkout, or or run the bundled Zephyr installer (npx --package @typecad/framework-zephyr zephyr-installer).",
+        `Zephyr ${zephyrVersion} is outside the supported range (${compat.range}) for @typecad/framework-zephyr. ` +
+          'Re-pin your tree with the installer, or set ZEPHYR_BASE to a compatible Zephyr checkout.',
       ],
-      fixCommand: undefined,
+      fixCommand: ZEPHYR_INSTALL_CMD,
     };
   }
 
-  // 3. west + version OK — only check the board when a target is configured and
-  // the lookup was able to answer. A missing/absent target is not a board
+  // 4. Tree OK — only check the board when a target is configured and the
+  // lookup was able to answer. A missing/absent target is not a board
   // problem; an inconclusive lookup (no base) is reported as a skip, not a fail.
   if (buildTarget && boardTargetSupported === false) {
     return {
@@ -267,11 +317,12 @@ export function checkZephyrEnv(
       reason: 'board-not-supported',
       check,
       messages: [
-        `Board target '${resolvedBoardTarget}' was not found in this Zephyr checkout` +
-          (probe.zephyrBase ? ` (${join(probe.zephyrBase, 'boards')}).` : '.'),
-        "  Check the board id, or run `west boards` to list boards in this checkout.",
+        `Board '${resolvedBoardTarget}' isn't in your Zephyr tree` +
+          (probe.zephyrBase ? ` (${join(probe.zephyrBase, 'boards')})` : '') + '.' +
+          (boardSuggestion ? ` Did you mean '${boardSuggestion}'?` : '') +
+          " Fix the board: value in typecad-hal.config.ts.",
       ],
-      fixCommand: 'west boards',
+      fixCommand: undefined,
     };
   }
 

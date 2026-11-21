@@ -68,19 +68,27 @@ export function fsInitLines(): string[] {
     '    return buf;',
     '}',
     '',
-    'static bool __tc_fs_begin(void) { __tc_fs_ensure_mount(); return true; }',
     '',
+    // The read buffer is a small RING of static slots (not one): a single
+    // shared buffer made back-to-back reads overwrite each other, AND the
+    // 256-byte ceiling hard-truncated longer files — a read-modify-write
+    // cycle then baked the truncation into the file permanently
+    // (demo-blackbox round 4: the journal lost lines and glued fragments
+    // like 'thr$J,5,boot' across boots, observed on hardware). The ring
+    // keeps successive reads alive like the string-literal slots; the
+    // ceiling is raised to 1024 and reads CLAMP there (documented bound —
+    // the returned const char* contract cannot carry dynamic length).
     'static const char* __tc_fs_read_text(const char* path) {',
     '    __tc_fs_ensure_mount();',
-    '    static char buf[256];',
+    '    static char ring[4][1024];',
+    '    static uint8_t slot = 0U;',
+    '    slot = static_cast<uint8_t>((slot + 1U) % 4U);',
+    '    char* buf = ring[slot];',
     '    buf[0] = 0;',
     '    struct fs_file_t f;',
     '    fs_file_t_init(&f);',
     '    if (fs_open(&f, __tc_fs_path(path), FS_O_READ) == 0) {',
-    '        // Terminate at the READ length: the buffer is static and shared',
-    '        // across reads, so bytes from a longer previous file survive a',
-    '        // short read otherwise.',
-    '        ssize_t n = fs_read(&f, buf, sizeof(buf) - 1);',
+    '        ssize_t n = fs_read(&f, buf, sizeof(ring[0]) - 1);',
     '        buf[(n > 0) ? n : 0] = 0;',
     '        (void)fs_close(&f);',
     '    }',

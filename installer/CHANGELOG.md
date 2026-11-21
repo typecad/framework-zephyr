@@ -1,5 +1,26 @@
 # @typecad/zephyr-installer
 
+## 1.0.0-alpha.25
+
+### Patch Changes
+
+- ## Shallow manifest clone: `west init -o=--depth=1`
+  
+  The full zephyr-rtos/zephyr history (~1 GB of pack data) is no longer
+  downloaded. `west init` now shallow-clones the manifest repository at the
+  pinned tag (`-o=--depth=1` forwards to `git clone --branch <tag> --depth=1`),
+  cutting the workspace step to roughly the checkout size.
+  
+  Safe because nothing downstream reads zephyr git history: the board catalog,
+  the SBOM, and `licenses` read file trees and `west list` output; the kernel
+  version comes from `$ZEPHYR_BASE/VERSION`. Re-running the installer against
+  the same pinned tag is a no-op fetch, so the clone stays shallow.
+  
+  The MODULES are deliberately not depth-limited: zephyr's manifest pins them
+  by SHA, and GitHub rejects `--depth` fetches that resolve a SHA (west
+  fetches all branch refs, then rev-parses the SHA — fails under `--depth`),
+  so `west update` remains a full clone.
+
 ## 1.0.0-alpha.14
 
 ### Minor Changes

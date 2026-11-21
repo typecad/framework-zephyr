@@ -39,7 +39,14 @@ export function applySensorKconfigExceptions(
 // ---------------------------------------------------------------------------
 
 export interface KconfigUsage {
+  /** The program lowers std::variant / std::optional / std::get — the
+   *  scaffold must pin CONFIG_STD_CPP17 instead of CPP14 (full libstdc++
+   *  ships the headers; only the standard level gates them). */
+  needsCpp17?: boolean;
   usesAdc?: boolean;
+  /** The program starts Threads: LP-core defconfigs ship MULTITHREADING=n,
+   *  and without this line `z_impl_k_thread_create` fails to link. */
+  usesThread?: boolean;
   usesPwm?: boolean;
   usesDac?: boolean;
   usesFS?: boolean;
@@ -53,6 +60,8 @@ export interface KconfigUsage {
   usesI2cTarget?: boolean;
   usesSpi?: boolean;
   usesUart?: boolean;
+  /** The program arms the __tc_uartrx receive ring (uart_irq_* calls). */
+  usesUartRx?: boolean;
   /** USB CDC-ACM serial used (usb.* ops). Selects the "next" USB device
    *  stack + CDC class; the class instances themselves are composed in the
    *  DT overlay and auto-default on once the node exists (assigning the
@@ -71,6 +80,13 @@ export interface KconfigUsage {
    *  (`default y depends on DT_HAS_<COMPATIBLE>_ENABLED`), so no symbol
    *  is assigned at all. */
   displayController?: 'st7796s' | 'ili9341' | 'ssd16xx' | 'uc81xx';
+  /** Who defines the mipi_dbi bridge node's device under the
+   *  zephyr-display transport: 'local-hold-cs' profiles emit an app-local
+   *  CS-holding host (DEVICE_DT_DEFINE on the node) — the in-tree
+   *  MIPI_DBI_SPI bridge binding the same compatible would define the same
+   *  device ordinal (multiple definition at link), so it must stay off.
+   *  'spi-bridge' (and undefined) means the in-tree bridge owns the node. */
+  displayDbiHost?: 'spi-bridge' | 'local-hold-cs';
   /** Panel bus family from the binding harvest: i2c-family panels (mono
    *  OLEDs) get I2C and no SPI/MIPI/DMA block at all. */
   displayBus?: 'i2c' | 'spi';
@@ -169,7 +185,48 @@ export interface KconfigUsage {
   i2cUsedInstances?: readonly number[];
   spiUsedInstances?: readonly number[];
   uartUsedInstances?: readonly number[];
+  i2sUsedInstances?: readonly number[];
+  /** The clock shim's parent counter's binding compatible (the harvested
+   *  counter node) — RTC-class parents need their SoC RTC driver forced on
+   *  (see RTC_PARENT_DRIVER_SYMBOLS). */
+  clockShimParentCompatible?: string;
+  /** The board's SRAM size in KB (the catalog's zephyr,sram fact) — the
+   *  stack floors clamp to a fraction of it; absent on chips whose catalog
+   *  predates the harvest (floors stay unclamped). */
+  ramKb?: number;
 }
+
+/**
+ * The C++ stack floors are sized for real boards (std::string/snprintf
+ * frames faulted at Zephyr's 4096 default — 8192 is the working floor). A
+ * small-RAM board cannot hold them: the stm32c0116_dk portability run
+ * overflowed its 12 KB region with 8K main + 8K workqueue + our thread
+ * stack + the ISR stack before the first instruction ran. Clamp each floor
+ * to an eighth of the board's RAM — both floors together can never exceed
+ * a quarter of it — so the floors shrink with the silicon instead of
+ * demanding what the region cannot hold. Boards with ≥ 64 KB keep the
+ * 8192 floors byte-for-byte. DATA from the catalog's zephyr,sram harvest;
+ * an absent fact (older catalog, probe flows) keeps the unclamped floor.
+ */
+function clampStackFloor(floor: number, ramKb: number | undefined): number {
+  if (ramKb === undefined || !Number.isFinite(ramKb) || ramKb <= 0) return floor;
+  return Math.min(floor, Math.max(512, Math.floor((ramKb * 1024) / 8)));
+}
+
+/**
+ * The SoC RTC-class driver symbol per counter binding — DATA, not a board
+ * branch. The Clock shim's zephyr,rtc-counter child DEVICE_DT_GETs its
+ * PARENT device; on SoCs whose RTC node binds an RTC-class driver, that
+ * driver's Kconfig defaults OFF exactly when a program also uses Counter
+ * (`default y if !COUNTER` flips) — and the parent device never
+ * instantiates, failing the link with an undefined __device_dts_ord_*. The
+ * symbol name is per binding (the same map shape as W1_FAMILY_CODES); a
+ * compatible not listed here needs no forcing (its parent driver rides the
+ * COUNTER subsystem and is already on).
+ */
+const RTC_PARENT_DRIVER_SYMBOLS: Record<string, string> = {
+  'st,stm32-rtc': 'CONFIG_RTC_STM32',
+};
 
 /**
  * Resolve the Kconfig symbol→value map for a prj.conf. Returns a Map preserving
@@ -189,6 +246,13 @@ export function resolveKconfigFragments(
   m.set('CONFIG_CONSOLE', 'y');
 
   if (usage.usesAdc) m.set('CONFIG_ADC', 'y');
+  if (usage.usesThread) {
+    m.set('CONFIG_MULTITHREADING', 'y');
+    // Our generated code never uses Zephyr TLS (no thread_local anywhere in
+    // emitted C++), and several targets' linker scripts (the ESP32 LP cores)
+    // carry no TLS sections at all — keep the kernel's TLS machinery off.
+    m.set('CONFIG_THREAD_LOCAL_STORAGE', 'n');
+  }
   // Sensors: only the umbrella — each in-tree driver is `default y` on its
   // DT_HAS_<COMPAT>_ENABLED, so the overlay's child node enables the driver.
   if (usage.usesSensor) m.set('CONFIG_SENSOR', 'y');
@@ -241,6 +305,12 @@ export function resolveKconfigFragments(
   if (usage.usesClock) {
     m.set('CONFIG_RTC', 'y');
     m.set('CONFIG_RTC_INIT_PRIORITY', '70');
+    // Force the SoC RTC-class driver on (a compatible-keyed DATA lookup —
+    // absent on SoCs whose counter parents need no RTC-class driver).
+    const rtcDriver = usage.clockShimParentCompatible
+      ? RTC_PARENT_DRIVER_SYMBOLS[usage.clockShimParentCompatible]
+      : undefined;
+    if (rtcDriver) m.set(rtcDriver, 'y');
   }
   if (usage.usesDac) m.set('CONFIG_DAC', 'y');
   if (usage.usesI2c) m.set('CONFIG_I2C', 'y');
@@ -302,28 +372,33 @@ export function resolveKconfigFragments(
     m.set('CONFIG_DMA', 'y');
     if (usage.displayTransport === 'zephyr-display') {
       // Native display-API transport: the mipi-dbi SPI bridge hosts the
-      // panel driver, which owns init/rotation/wire format. Controller-
-      // specific exceptions and the drop-in (compatible-driven) path:
-      //  - st7796s (registry profile): the stock bridge deasserts CS
-      //    between command and parameters (scrambles clone panels), so it
-      //    stays OFF — the adapter emits an app-local CS-holding host.
-      //  - ili9341 (registry profile): assign the prompted symbol explicitly
-      //    (survives DT-only probes; not the hidden ILI9XXX).
-      //  - synthesized profiles (no controller): assign NOTHING — panel
-      //    drivers are `default y depends on DT_HAS_<COMPATIBLE>_ENABLED`,
-      //    so the overlay's enabled node builds its own driver.
-      if (usage.displayController === 'st7796s') {
+      // panel driver, which owns init/rotation/wire format. WHICH device
+      // defines the mipi_dbi bridge node decides the bridge driver — key on
+      // the profile's dbiHost, not the controller string:
+      //  - 'local-hold-cs' (st7796s clone panels — the stock bridge
+      //    deasserts CS between command and parameters): the adapter emits
+      //    an app-local CS-holding host that DEVICE_DT_DEFINEs the node
+      //    itself — the in-tree bridge binding the same compatible would
+      //    define the same __device_dts_ord_* (multiple definition at
+      //    link). The bridge stays OFF; the node's compatible still
+      //    generates the property macros the app host reads.
+      //  - 'spi-bridge' (and unknown): the in-tree bridge owns the node.
+      // The panel driver symbol is per controller, assigned explicitly
+      // (survives DT-only probes; not the hidden ILI9XXX). Synthesized
+      // profiles now reach here too — panelControllerFor matches the
+      // compatible TAIL ('sitronix,st7796s' → st7796s).
+      if (usage.displayDbiHost === 'local-hold-cs') {
         m.set('CONFIG_MIPI_DBI_SPI', 'n');
-        m.set('CONFIG_ST7796S', 'y');
-      } else if (usage.displayController === 'ili9341') {
-        m.set('CONFIG_MIPI_DBI_SPI', 'y');
-        m.set('CONFIG_ILI9341', 'y');
       } else {
         m.set('CONFIG_MIPI_DBI_SPI', 'y');
       }
-      // E-ink families (Stage 4): the panel driver under the mipi-dbi SPI
-      // bridge — ssd16xx/uc81xx own the flash-cycle refresh + BUSY wait.
-      if (usage.displayController === 'ssd16xx') {
+      if (usage.displayController === 'st7796s') {
+        m.set('CONFIG_ST7796S', 'y');
+      } else if (usage.displayController === 'ili9341') {
+        m.set('CONFIG_ILI9341', 'y');
+      } else if (usage.displayController === 'ssd16xx') {
+        // E-ink families (Stage 4): the panel driver under the mipi-dbi SPI
+        // bridge — ssd16xx/uc81xx own the flash-cycle refresh + BUSY wait.
         m.set('CONFIG_SSD16XX', 'y');
       } else if (usage.displayController === 'uc81xx') {
         m.set('CONFIG_UC81XX', 'y');
@@ -380,7 +455,9 @@ export function resolveKconfigFragments(
     // (without it, Kconfig silently forces them all to n).
     m.set('CONFIG_NETWORKING', 'y');
     m.set('CONFIG_WIFI', 'y');
-    m.set('CONFIG_WIFI_ESP32', 'y');            // family-wide ESP32 driver (esp32/s3/c3/c6)
+    // family-wide ESP32 driver (esp32/s3/c3/c6). The board gate admits WiFi
+    // only for radios listed in wifi-radios.ts — keep the two in step.
+    m.set('CONFIG_WIFI_ESP32', 'y');
     m.set('CONFIG_NET_L2_ETHERNET', 'y');
     m.set('CONFIG_NET_IPV4', 'y');
     m.set('CONFIG_NET_UDP', 'y');               // transitive dep of NET_DHCPV4
@@ -405,12 +482,18 @@ export function resolveKconfigFragments(
     m.set('CONFIG_NET_TX_STACK_SIZE', '2048');
     m.set('CONFIG_NET_RX_STACK_SIZE', '2048');
     m.set('CONFIG_MAIN_STACK_SIZE', '5200');
-    // NOTE: wifi.set_tx_power needs no Kconfig symbol. esp_wifi_set_max_tx_power
-    // programs the radio at runtime; its ceiling is baked into the prebuilt
-    // libphy.a / PHY init data, not a prj.conf knob. The ESP-IDF symbol
-    // ESP_PHY_MAX_WIFI_TX_POWER lives in components/esp_phy/Kconfig, which the
-    // Zephyr module integration does NOT source — assigning it here would abort
-    // the build ("undefined symbol").
+    // RADIO TX POWER CAP (bench-established fact: the esp32 devkits brown out
+    // at the 20 dBm TX current spike — reset reason BROWNOUT_RST in a boot
+    // loop; at 10 dBm the spike clears the detector on a healthy rail). The
+    // assignable symbol is CONFIG_ESP32_PHY_MAX_TX_POWER (soc/espressif/
+    // common/Kconfig, gated on WIFI_ESP32 — this block's family): the esp32s3
+    // PHY maps it onto the init-data table via zephyr_compat, so the cap
+    // applies from the FIRST TX (probe/auth), before any runtime API could
+    // run. The ESP-IDF name ESP_PHY_MAX_WIFI_TX_POWER lives in
+    // components/esp_phy/Kconfig which the Zephyr module integration never
+    // sources — that symbol is dead; this one is live. 10 dBm is the Kconfig
+    // range floor and ample for bench work next to the AP.
+    m.set('CONFIG_ESP32_PHY_MAX_TX_POWER', '10');
   }
   if (usage.usesHttp) {
     // HTTP/S rides on the networking stack. The shim does its own
@@ -594,6 +677,11 @@ export function resolveKconfigFragments(
     // without it the mount path links fine but the format call is undefined.
     m.set('CONFIG_FILE_SYSTEM_MKFS', 'y');
   }
+  // UART receive: the __tc_uartrx ring arms uart_irq_callback_user_data_set /
+  // uart_irq_rx_enable — real code paths only under an interrupt-driven
+  // driver. Without this the calls compile as no-op stubs and RX reads -1
+  // forever (no diagnostic — the API exists either way).
+  if (usage.usesUartRx) m.set('CONFIG_UART_INTERRUPT_DRIVEN', 'y');
   // usesUart: the board enables the console UART by default; the overlay (not
   // Kconfig) is where a UART node would be enabled, so no symbol here.
   // Random: <zephyr/random/random.h> sys_rand_get is backed by the random
@@ -614,13 +702,28 @@ export function resolveKconfigFragments(
   // workqueue itself is unconditionally built (no CONFIG_SYSTEM_WORKQUEUE symbol
   // exists in Zephyr — that was a phantom that broke real builds); only the
   // stack size is a real Kconfig knob.
-  m.set('CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE', '8192');
+  m.set('CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE', String(clampStackFloor(8192, usage.ramKb)));
 
   // C++ support.
   m.set('CONFIG_CPP', 'y');
   m.set('CONFIG_NEWLIB_LIBC', 'y');
   m.set('CONFIG_REQUIRES_FULL_LIBCPP', 'y');
-  m.set('CONFIG_STD_CPP14', 'y');
+  // C++17 when the program lowers std::variant/optional/holds_alternative
+  // (unions, typeof narrowing) — C++14 rejects those headers even with full
+  // libstdc++. Everything else stays on the C++14 baseline.
+  if (usage.needsCpp17) {
+    m.set('CONFIG_STD_CPP17', 'y');
+  } else {
+    m.set('CONFIG_STD_CPP14', 'y');
+  }
+
+  // Full libstdc++ programs carry std::string/std::vector frames (by-value
+  // parameters, temporaries, snprintf buffers) the C floor never sees —
+  // a C++-heavy program at the 4096 default overflowed and faulted in
+  // _restore_context after main returned (gallery multi-file section).
+  // 8192 is the working floor for full-C++ programs — clamped from the
+  // board's RAM fact below (see clampStackFloor).
+  m.set('CONFIG_MAIN_STACK_SIZE', String(clampStackFloor(8192, usage.ramKb)));
 
   // Main thread stack. WiFi already bumps this to 5200 (esp_wifi device init
   // is stack-hungry); HTTP/MQTT + TLS also bump it (the mbedTLS handshake is
@@ -635,7 +738,11 @@ export function resolveKconfigFragments(
   // stack overflow; 8192 is kept here because deep ui_tick call nesting still
   // wants the headroom.
   if (!usage.usesWifi && !usage.usesHttp && !usage.usesMqtt) {
-    m.set('CONFIG_MAIN_STACK_SIZE', usage.usesDisplay ? '8192' : '4096');
+    // Full-libstdc++ programs keep the 8192 floor set above (C++ frames:
+    // by-value std::string/vector params + temporaries overflowed 4096 and
+    // faulted in _restore_context after main returned); C programs keep the
+    // historic 4096.
+    m.set('CONFIG_MAIN_STACK_SIZE', String(clampStackFloor(8192, usage.ramKb)));
   }
 
   if (debug) {

@@ -111,7 +111,7 @@ export function buildSummary(v, p, envName, platforms = 'all') {
     `  1. Download the micromamba static binary (${p.mamba}).`,
     `  2. Create the '${envName}' conda env (west, cmake, ninja, gperf, ...).`,
     sdkLine,
-    `  4. Run 'west init' (--mr ${rev}) + 'west update' for a vanilla Zephyr workspace.`,
+    `  4. Run 'west init' (--mr ${rev}, depth-1 clone) + 'west update' for a vanilla Zephyr workspace.`,
     '',
     'Locations (defaults; override via MAMBA_ROOT_PREFIX / WORKSPACE_DIR / SDK_INSTALL_PARENT):',
     `  micromamba root : ${mambaRoot}`,

@@ -39,7 +39,7 @@ import type {
   TouchAdapterCodegen,
 } from '@typecad/cuttlefish/api/shared';
 import { DEFAULT_STDLIB_SUPPORT } from '@typecad/cuttlefish/api/shared';
-import { applyStringMethodRewrites } from '@typecad/cuttlefish/api/shared';
+import { applyStringMethodRewrites, replaceOutsideStringLiterals } from '@typecad/cuttlefish/api/shared';
 import { programUsesSafety } from '@typecad/cuttlefish/api';
 import { entryHasUI } from '@typecad/cuttlefish/ui-hook';
 import { generateBoard, generateBoardModuleFromContract } from './boardgen.js';
@@ -49,7 +49,7 @@ import {
   type BoardCatalogSyncReport,
   type BoardCatalogEnsureResult,
 } from './sdk/board-catalog-sync.js';
-import { setActiveChip, getActiveChip, NO_BOARD_CHIP } from './chips/index.js';
+import { setActiveChip, getActiveChip, setActiveI2sUsage, NO_BOARD_CHIP } from './chips/index.js';
 import { resolveChipFromBoard } from './chips/resolve.js';
 import { emitGpioDevDispatcher } from './chips/controllers.js';
 import type { ZephyrChipDescriptor } from './chips/types.js';
@@ -71,6 +71,14 @@ function visitResolvedHalOps(
   visit: (node: unknown) => void,
 ): void {
   for (const op of program?.resolvedHalOps ?? []) visit({ operation: op });
+  // The shim program carries every file's IR under mergedFiles (see
+  // transpile.ts) — a resolved op lifted onto a MODULE program (a thread
+  // started in a section file, an ADC read in a sensor module) must count
+  // toward the program-wide state blocks just the same.
+  const merged = (program as { mergedFiles?: ProgramIR[] } | undefined)?.mergedFiles;
+  if (merged) {
+    for (const file of merged) visitResolvedHalOps(file, visit);
+  }
 }
 
 /**
@@ -382,6 +390,18 @@ export function collectVerbUsage(program: ProgramIR | undefined): {
     if (!f) { f = { write: false, read: false, readAt: false }; out.i2s.set(inst, f); }
     return f;
   };
+  // A Clock op interpolated into ANOTHER HAL call's arguments never becomes
+  // an IR node — resolveHALExprToText lowers it while the IR builds and
+  // bakes its C++ (which calls __tc_days_from_civil / __tc_civil_from_days)
+  // into a plain string payload (the __EMIT__ prelude). Scan every string
+  // leaf for the helper tokens so the shim gate sees what the text uses —
+  // the same discipline collectRawMatches applies to __tc_dt_* specs
+  // (demo-timed-wake: `UART0.writeLine(Clock.now())` compiled without the
+  // helper and failed with "not declared in this scope").
+  const scanText = (text: string): void => {
+    if (text.includes('__tc_days_from_civil')) out.clock.now = true;
+    if (text.includes('__tc_civil_from_days')) out.clock.set = true;
+  };
   const visit = (node: unknown): void => {
     if (!node || typeof node !== 'object') return;
     const n = node as Record<string, unknown>;
@@ -403,6 +423,7 @@ export function collectVerbUsage(program: ProgramIR | undefined): {
       }
     }
     for (const v of Object.values(n)) {
+      if (typeof v === 'string') { scanText(v); continue; }
       if (Array.isArray(v)) { for (const item of v) visit(item); }
       else if (v && typeof v === 'object') visit(v);
     }
@@ -546,6 +567,7 @@ export function collectThreads(program: ProgramIR | undefined): Map<number, { in
   return threads;
 }
 import { lowerHalOp } from './lowering/index.js';
+import { ZEPHYR_OP_CPP_RETURN_TYPES } from './lowering/op-types.js';
 import { adcInitLines, adcChannelForPin } from './lowering/adc.js';
 import { pwmInitLines } from './lowering/pwm.js';
 import { dacInitLines } from './lowering/dac.js';
@@ -575,6 +597,14 @@ import { usbInitLines, usbdDeviceLines } from './lowering/usb.js';
  * register access behind it. Raw-register form (not the STM32 LL headers) so
  * the shim stays include-light; AUTOSAR-clean via reinterpret_cast.
  */
+/**
+ * The series whose DBGMCU register shape the debug-sleep shim pokes — keyed
+ * on the SoC's OWN harvested compatible (`st,stm32f411` → F4). DATA, not a
+ * name branch: a series the table doesn't list gets no shim (its register
+ * layout differs), exactly like RTC_PARENT_DRIVER_SYMBOLS keys bindings.
+ */
+const DBGMCU_DEBUG_SLEEP_SOC = /^st,stm32f4/;
+
 function stm32f4DbgmcuLines(): string[] {
   return [
     '// CUTTLEFISH_STM32_DBGMCU_BEGIN',
@@ -645,7 +675,8 @@ export class ZephyrStrategy implements PlatformStrategy {
     pinNames: readonly string[];
     padAliases?: readonly { exportName: string; padName: string }[];
     peripherals: { i2c: boolean; spi: boolean; uart: boolean };
-  }): { boardTs: string; boardJson: string } {
+    buildTarget?: string;
+  }): { boardTs: string; boardJson: string; gatedExports?: readonly string[] } {
     return generateBoardModuleFromContract(opts);
   }
 
@@ -688,7 +719,8 @@ export class ZephyrStrategy implements PlatformStrategy {
     const helpers = (a as { usedPolyfillHelpers?: Set<string> } | undefined)?.usedPolyfillHelpers;
     const needsCstdio = uses('usesCstdio') || uses('usesFS') || uses('usesPreferences')
       || uses('usesUart') || uses('usesUsb')
-      || !!helpers?.has('__tc_print') || !!helpers?.has('__tc_println');
+      || !!helpers?.has('__tc_print') || !!helpers?.has('__tc_println')
+      || !!helpers?.has('__tc_frame_line') || !!helpers?.has('__tc_expect_num') || !!helpers?.has('__tc_expect_str');
     if (needsCstdio) inc.push('<cstdio>');
     if (uses('usesI2C')) inc.push('<zephyr/drivers/i2c.h>');
     if (uses('usesSensor')) inc.push('<zephyr/drivers/sensor.h>');
@@ -750,6 +782,7 @@ export class ZephyrStrategy implements PlatformStrategy {
       '<zephyr/net/net_mgmt.h>', '<zephyr/net/wifi_mgmt.h>',
       '<zephyr/net/net_if.h>', '<zephyr/net/net_ip.h>',
       '<zephyr/net/conn_mgr_connectivity.h>', '<zephyr/net/conn_mgr_monitor.h>',
+      '<string>',  // __tc_wifi_str's std::string overload
     );
     // HTTP/S client: Zephyr's http_client_req runs over a pre-connected socket,
     // so the shim pulls in the BSD socket + POSIX DNS surfaces alongside the
@@ -768,7 +801,7 @@ export class ZephyrStrategy implements PlatformStrategy {
     // (mqtt_sec_config). <cstring> backs the shim's memcpy/strlen.
     if (uses('usesMqtt')) inc.push(
       '<zephyr/net/mqtt.h>', '<zephyr/net/socket.h>',
-      '<zephyr/net/tls_credentials.h>', '<cstring>',
+      '<zephyr/net/tls_credentials.h>', '<cstring>', '<string>',
     );
     // Preferences: Zephyr settings subsystem (ZMS backend) — settings_load/
     // settings_save_one/settings_delete + the SETTINGS_STATIC_HANDLER_DEFINE
@@ -905,6 +938,10 @@ export class ZephyrStrategy implements PlatformStrategy {
     const chip = this.resolveChip(ctx, program);
     const a = (ctx as any)?.analysis;
     const uses = (f: string): boolean => (a ? !!a[f] : true);
+    // Order-proof nullish trigger: the lowering site sets this on the build
+    // context when ANY `??` lowers to cuttlefish_nullish (the textual scan
+    // can miss it depending on pipeline phase).
+    const nullishSeen = (ctx as unknown as { nullishHelperSeen?: boolean } | undefined)?.nullishHelperSeen === true;
     const helpers = (a as { usedPolyfillHelpers?: Set<string> } | undefined)?.usedPolyfillHelpers;
 
     // --- Core shim, gated item by item on actual use ------------------------
@@ -912,11 +949,14 @@ export class ZephyrStrategy implements PlatformStrategy {
     // shim block at all. Everything up to the #endif composes into one guard
     // body; the guard itself is only stamped when the body is non-empty.
     const guardBody: string[] = [];
+    // Defines that must precede the main shim guard (see the TRACE_UI note
+    // below — a header that consumed the guard must not hide them).
+    const preGuardLines: string[] = [];
     // CUTTLEFISH_UNDEFINED: needed when the file references null/undefined
     // literals (usesNullish), emits nullish helper CALLS (usesNullishHelper),
     // or has async functions (the async state machine uses the macro for
     // default waitFor* timeouts — not visible to the nullish scanners).
-    if (uses('usesNullish') || uses('usesNullishHelper') || uses('hasAsync')) {
+    if (uses('usesNullish') || uses('usesNullishHelper') || uses('hasAsync') || nullishSeen) {
       guardBody.push(
         '#ifndef CUTTLEFISH_UNDEFINED',
         '#define CUTTLEFISH_UNDEFINED 0',
@@ -927,7 +967,7 @@ export class ZephyrStrategy implements PlatformStrategy {
     // cuttlefish_exists CALLS (?? / ?. lowering). A file that only references
     // null/undefined literals needs just the macro above — the same
     // distinction the setup emitter's strip filter documents.
-    if (uses('usesNullishHelper')) {
+    if (uses('usesNullishHelper') || nullishSeen) {
       guardBody.push(
         'template<typename T> inline bool cuttlefish_is_nullish(const T& v) { return false; }',
         'inline bool cuttlefish_is_nullish(long long v) { return v == CUTTLEFISH_UNDEFINED; }',
@@ -935,8 +975,20 @@ export class ZephyrStrategy implements PlatformStrategy {
         'inline bool cuttlefish_is_nullish(double v) { return v == static_cast<double>(CUTTLEFISH_UNDEFINED); }',
         'inline bool cuttlefish_is_nullish(bool v) { return v == false; }',
         'template<typename T> inline bool cuttlefish_is_nullish(T* v) { return v == nullptr; }',
+        // A std::function (an optional-call target, cb?.()) is nullish when
+        // empty - the generic template returned false and the guard INVOKED
+        // an empty std::function (std::bad_function_call).
+        'inline bool cuttlefish_is_nullish(const std::function<void()>& v) { return !static_cast<bool>(v); }',
+        'template<typename R> inline bool cuttlefish_is_nullish(const std::function<R()>& v) { return !static_cast<bool>(v); }',
+        'template<typename R, typename A> inline bool cuttlefish_is_nullish(const std::function<R(A)>& v) { return !static_cast<bool>(v); }',
+        // An OPTIONAL string field coalesces through cuttlefish_nullish_str
+        // below (empty = the absent state — optionality is flattened, so an
+        // omitted field lowers to the empty string). The GENERIC is_nullish
+        // keeps the template: a plain string local holding an explicit
+        // empty string is NOT nullish (the ts-patterns oracle pins it).
         'template<typename T> inline bool cuttlefish_exists(const T& v) { return !cuttlefish_is_nullish(v); }',
         'template<typename T, typename U> inline T cuttlefish_nullish(const T& a, U b) { return !cuttlefish_is_nullish(a) ? a : (T)b; }',
+        'inline std::string cuttlefish_nullish_str(const std::string& a, const std::string& b) { return !a.empty() ? a : b; }',
       );
     }
     // The runtime clock contract: __tc_now_ms() is the monotonic ms clock
@@ -959,7 +1011,9 @@ export class ZephyrStrategy implements PlatformStrategy {
     // libc overload.
     if (uses('usesNum')) {
       guardBody.push(
-        'struct __tc_Num {',
+        // static: shim lines splice into module headers too (header-inlined
+        // methods call the escaped spellings) — the instance must be TU-local.
+        'static struct __tc_Num {',
         '    static long abs(long x) { return x < 0 ? -x : x; }',
         '    static long min(long a, long b) { return a < b ? a : b; }',
         '    static long max(long a, long b) { return a > b ? a : b; }',
@@ -969,15 +1023,31 @@ export class ZephyrStrategy implements PlatformStrategy {
         '    static long abs_(long x) { return x < 0 ? -x : x; }',
         '    static long min_(long a, long b) { return a < b ? a : b; }',
         '    static long max_(long a, long b) { return a > b ? a : b; }',
+        // JS numbers are doubles: fractional arguments must not quantize
+        // through long (`min(100.0, socPct)` silently truncated the battery
+        // SOC to integers — compiles clean, only -Wdouble-promotion noise).
+        // (demo-charger finding 5; subset-matrix num/min-max-fractional.)
+        // Mixed integer/double arguments are an ambiguity error by overload
+        // resolution — loud, not lossy.
+        '    static double abs(double x) { return x < 0 ? -x : x; }',
+        '    static double min(double a, double b) { return a < b ? a : b; }',
+        '    static double max(double a, double b) { return a > b ? a : b; }',
+        '    static double abs_(double x) { return x < 0 ? -x : x; }',
+        '    static double min_(double a, double b) { return a < b ? a : b; }',
+        '    static double max_(double a, double b) { return a > b ? a : b; }',
+        // Exact int overloads: otherwise identical integer arguments are
+        // ambiguous between the long and double candidate sets.
+        '    static int abs(int a) { return a < 0 ? -a : a; }',
+        '    static int min(int a, int b) { return a < b ? a : b; }',
+        '    static int max(int a, int b) { return a > b ? a : b; }',
+        '    static int abs_(int a) { return a < 0 ? -a : a; }',
+        '    static int min_(int a, int b) { return a < b ? a : b; }',
+        '    static int max_(int a, int b) { return a > b ? a : b; }',
         '} Num;',
-        'inline long abs(long v) { return v < 0 ? -v : v; }',
-        'inline long min(long a, long b) { return a < b ? a : b; }',
-        'inline long max(long a, long b) { return a > b ? a : b; }',
-        // Escaped free-function spellings — the escape applies to bare call
-        // sites on some paths (abs_(-42)); cover both.
-        'inline long abs_(long v) { return v < 0 ? -v : v; }',
-        'inline long min_(long a, long b) { return a < b ? a : b; }',
-        'inline long max_(long a, long b) { return a > b ? a : b; }',
+        // The free-function spellings (inline long abs(long) etc.) are
+        // GONE: they redeclare <cstdlib>'s C++ overload set and hard-conflict
+        // in multi-TU programs, and bare call sites now lower to the struct's
+        // escaped spellings (Num.abs_/Num.min_/Num.max_) at the resolver.
       );
     }
     // Random PRNG shim: the Random namespace lowers to the __tc_rand_* PRNG.
@@ -1035,6 +1105,83 @@ export class ZephyrStrategy implements PlatformStrategy {
         'inline void __tc_println(const char* s) { printf("%s\\n", s); }',
         'inline void __tc_println(double v) { __tc_fmt_num(v); printf("\\n"); }',
       );
+      // The console lowering passes std::string-typed expressions through
+      // verbatim (`__tc_print(file.read())` — 19-fs/14-preferences): without
+      // an overload g++ reports "no matching function for call to
+      // __tc_print(std::string)". Gated on usesStdString so a string-free
+      // program never sees the std::string name without <string>.
+      if (uses('usesStdString')) {
+        guardBody.push(
+          'inline void __tc_print(const std::string& s) { printf("%s", s.c_str()); }',
+          'inline void __tc_println(const std::string& s) { printf("%s\\n", s.c_str()); }',
+        );
+      }
+      // Framed protocol emission (the test-runner wire contract — engine
+      // test-runner/wire.ts): every [TC: frame is ONE printf carrying an XOR
+      // checksum suffix ("*%02x") over the frame bytes, and string payloads
+      // carry runtime escapes for '\\', ':' and '*' so host-side field
+      // splitting and checksum detection are unambiguous. The multi-piece
+      // __tc_print frames could be split by anything preempting between the
+      // pieces (trace events, printk); the host now detects that loudly.
+      // Buffer note: 192 bytes; a frame longer than that truncates content
+      // but keeps a consistent checksum — test names/expectations far past
+      // that size are unrealistic, and truncation never fabricates a verdict.
+      guardBody.push(
+        [
+          'static inline void __tc_frame_send(const char* s, size_t n) {',
+          '    unsigned int x = 0U;',
+          '    for (size_t i = 0U; i < n; ++i) {',
+          '        x ^= static_cast<unsigned int>(static_cast<unsigned char>(s[i]));',
+          '    }',
+          '    printf("[%s*%02x]\\n", s, x & 0xFFU);',
+          '}',
+          'static inline size_t __tc_frame_begin(char* b, size_t cap, const char* inner) {',
+          '    int n = snprintf(b, cap, "TC:%s", inner);',
+          '    if (n <= 0) { b[0] = \'\\0\'; return 0U; }',
+          '    size_t len = static_cast<size_t>(n);',
+          '    return (len < cap) ? len : (cap - 1U);',
+          '}',
+          'inline void __tc_frame_line(const char* inner) {',
+          '    char b[192];',
+          '    __tc_frame_send(b, __tc_frame_begin(b, sizeof(b), inner));',
+          '}',
+          'inline void __tc_expect_num(const char* prefix, double v) {',
+          '    char b[192];',
+          '    char nb[32];',
+          '    size_t at = __tc_frame_begin(b, sizeof(b), prefix);',
+          '    int n = snprintf(b + at, sizeof(b) - at, "%s", __tc_fmt_num_buf(v, nb, sizeof(nb)));',
+          '    if (n > 0) {',
+          '        size_t room = sizeof(b) - at;',
+          '        size_t len = static_cast<size_t>(n);',
+          '        at += (len < room) ? len : (room - 1U);',
+          '    }',
+          '    __tc_frame_send(b, at);',
+          '}',
+          'static inline size_t __tc_frame_escape_append(char* b, size_t cap, size_t at, const char* s) {',
+          '    for (size_t i = 0U; s[i] != \'\\0\'; ++i) {',
+          '        const char c = s[i];',
+          '        const bool esc = (c == \'\\\\\') || (c == \':\') || (c == \'*\');',
+          '        const size_t need = esc ? 2U : 1U;',
+          '        if ((at + need) >= cap) { break; }',
+          '        if (esc) { b[at] = \'\\\\\'; b[at + 1U] = c; } else { b[at] = c; }',
+          '        at += need;',
+          '    }',
+          '    b[at] = \'\\0\';',
+          '    return at;',
+          '}',
+          'inline void __tc_expect_str(const char* prefix, const char* v) {',
+          '    char b[192];',
+          '    size_t at = __tc_frame_begin(b, sizeof(b), prefix);',
+          '    at = __tc_frame_escape_append(b, sizeof(b), at, v);',
+          '    __tc_frame_send(b, at);',
+          '}',
+        ].join('\n'),
+      );
+      if (uses('usesStdString')) {
+        guardBody.push(
+          'inline void __tc_expect_str(const char* prefix, const std::string& v) { __tc_expect_str(prefix, v.c_str()); }',
+        );
+      }
     }
     // Trace user-event helpers (Trace.mark / Trace.event → trace.mark /
     // trace.event ops): one [TR:EV:<uptime_ms>:<name>[:<value>] console line
@@ -1057,16 +1204,40 @@ export class ZephyrStrategy implements PlatformStrategy {
     // (numbers/booleans) so a single __tc_dev_put(dev, value) call site formats
     // any writable scalar — the same overload contract __tc_print uses. Emitted
     // when the program writes a UART or USB port (both include uart.h).
+    // Carries the UART hardware markers so it is hoisted OUT of the TU-wide
+    // shim guard with the other driver definitions — a module header that
+    // defines CUTTLEFISH_SHIM_DEFINED first would otherwise hide these from
+    // the entry TU.
     if (uses('usesUart') || uses('usesUsb')) {
+      // Own marker family (NOT the UART driver block): the helper serves
+      // UART AND CDC writes, and the setup.ts backstop strips UART-marked
+      // blocks whenever usesUart is false — which silently deleted the
+      // helper from USB-only programs (every write failed to compile).
       guardBody.push(
+        '// CUTTLEFISH_SERIAL_WRITE_BEGIN',
         'static inline void __tc_dev_put(const struct device* dev, const char* s) {',
-        '    for (; *s != \'\\0\'; ++s) { uart_poll_out(dev, *s); }',
+        // A double backslash in the JS literal: a single '\0' IS the NUL
+        // character in the emitted C++ text (g++: "null character(s)
+        // preserved in literal") — the source must carry the two-char escape.
+        "    for (; *s != '\\0'; ++s) { uart_poll_out(dev, *s); }",
         '}',
         'static inline void __tc_dev_put(const struct device* dev, double v) {',
         '    char __b[32];',
         '    __tc_dev_put(dev, __tc_fmt_num_buf(v, __b, sizeof(__b)));',
         '}',
+        '// CUTTLEFISH_SERIAL_WRITE_END',
       );
+      // The port-write lowering passes std::string-typed expressions through
+      // verbatim (`uart.write(file.read())` — bench-console's log lines):
+      // without an overload g++ reports "no matching function for call to
+      // __tc_dev_put(const device*&, std::string&)". Gated on usesStdString
+      // so a string-free program never sees the std::string name without
+      // <string> — the same contract as the __tc_print overloads above.
+      if (uses('usesStdString')) {
+        guardBody.push(
+          'static inline void __tc_dev_put(const struct device* dev, const std::string& s) { __tc_dev_put(dev, s.c_str()); }',
+        );
+      }
     }
 
     // Per-peripheral bus state — gated on the same ctx.analysis.usesX flags as
@@ -1165,6 +1336,12 @@ export class ZephyrStrategy implements PlatformStrategy {
           f.readAt = f.readAt || flags.readAt;
         }
       }
+      // The lowerings resolve this chip via getActiveChip; the WRITE lowering
+      // likewise needs this controller's verb set for the loopback discipline
+      // (start RX before the first TX block when the program also reads).
+      // Without the verb scan (capability query) mirror the full-usage
+      // fallback the init lines use below.
+      setActiveI2sUsage(new Map(folded.map((f, i) => [i, i2sUsage ? { ...f } : { write: true, read: true, readAt: true }])));
       for (let i = 0; i < nCtrl; i++) {
         const f = folded[i]!;
         if (i2sUsage && !f.write && !f.read && !f.readAt) continue;
@@ -1174,6 +1351,10 @@ export class ZephyrStrategy implements PlatformStrategy {
         const blockFrames = facts?.blockFrames ?? 64;
         guardBody.push(...i2sInitLines(chip, i, blockFrames * channels * (bits / 8), i2sUsage ? f : { write: true, read: true, readAt: true }));
       }
+    } else {
+      // A build without I2S must not inherit the previous program's map (the
+      // preview/LSP transpiles many programs in one process).
+      setActiveI2sUsage(undefined);
     }
     if (uses('usesUart') && chip.uart) {
       for (let i = 0; i < chip.uart.controllers.length; i++) {
@@ -1235,7 +1416,11 @@ export class ZephyrStrategy implements PlatformStrategy {
         ?.zephyr?.trace;
       const traceEnabled = traceCfg?.enabled === true;
       if (traceEnabled && entryHasUI()) {
-        guardBody.push(
+        // OUTSIDE the main shim guard (preGuardLines): a module header that
+        // defined CUTTLEFISH_SHIM_DEFINED first would otherwise swallow the
+        // guard body carrying this define and the entry TU would never
+        // activate frame-stats instrumentation.
+        preGuardLines.push(
           '#if defined(CUTTLEFISH_ENTRY_TU)',
           '#define CUTTLEFISH_TRACE_UI 1',
           '#endif',
@@ -1325,27 +1510,134 @@ export class ZephyrStrategy implements PlatformStrategy {
     // the Black Pill the only recovery is the BOOT0 bootloader. Zephyr's
     // CONFIG_STM32_ENABLE_DEBUG_SLEEP_STOP sets only DBG_STOP on F4 (the
     // soc_config.c F1/L1 branch is the one that sets DBG_SLEEP), so the bits
-    // are set here at boot, unconditionally for dev boards.
-    // (soc is empty on board-resolved chips — the SoC name rides in the
-    // qualified id's variant segment, e.g. 'blackpill_f411ce/stm32f411xe'.)
-    if (chip.soc.startsWith('stm32f4') || /stm32f4\d*/.test(chip.id)) {
+    // are set here at boot, unconditionally for dev boards. Keyed on the
+    // SoC's OWN harvested compatible (the soc node's
+    // `compatible = "st,stm32f411"`) — DATA, not a name branch; series the
+    // table doesn't list compile nothing.
+    if (chip.socCompatible && DBGMCU_DEBUG_SLEEP_SOC.test(chip.socCompatible)) {
       guardBody.push(...stm32f4DbgmcuLines());
     }
 
     const lines: string[] = [];
     if (guardBody.length > 0) {
+      // Hardware peripheral blocks (`// CUTTLEFISH_*_BEGIN … _END`, the
+      // UART/GPIO/ADC/I2C driver shims) must NOT sit inside the TU-wide
+      // guard. A module header included before the entry's own shim carries
+      // the generic shim for its inline class bodies and defines
+      // CUTTLEFISH_SHIM_DEFINED first — the entire guarded region,
+      // including the ENTRY-ONLY hardware definitions, was then skipped and
+      // every __tc_uart0_* / __tc_int_* reference failed to resolve. Same
+      // hazard the DT-spec blocks below document; same cure: per-symbol
+      // guards outside the shared guard. Relative order is preserved
+      // (generic helpers → hardware blocks → DT specs).
+      const hardwareMarker = /^\/\/ CUTTLEFISH_([A-Z0-9_]+)_BEGIN$/;
+      const hardwareBlocks = new Map<string, string[]>();
+      const genericBody: string[] = [];
+      // Singleton blocks self-gate on CUTTLEFISH_ENTRY_TU (entry-TU
+      // definitions; every other sighting compiles prototypes or nothing)
+      // with their own order-safe branch guards. They hoist out of the main
+      // guard but must NOT take the per-TU wrapper: the wrapper is consumed
+      // at FIRST sight, and with headers carrying the shim splice that first
+      // sight is a module header — the entry TU would then never see the
+      // definitions. The settings-handler registration (PREFS), the matrix
+      // input callback (MATRIX), and the trace heartbeat (TRACE/TRACE_UI)
+      // are the singletons; everything else stays per-TU.
+      const singletonMarkers = new Set(['PREFS', 'MATRIX', 'TRACE', 'TRACE_UI', 'THREAD']);
+      const bareBlocks: string[][] = [];
+      for (let i = 0; i < guardBody.length; i += 1) {
+        const m = hardwareMarker.exec(guardBody[i]);
+        if (m) {
+          const endMarker = `// CUTTLEFISH_${m[1]}_END`;
+          const endIdx = guardBody.indexOf(endMarker, i);
+          const stop = endIdx === -1 ? guardBody.length : endIdx + 1;
+          if (singletonMarkers.has(m[1])) {
+            bareBlocks.push(guardBody.slice(i, stop));
+            i = stop - 1;
+            continue;
+          }
+          // Several lowerings share one marker family (the UART write helper
+          // and the per-controller state both ride CUTTLEFISH_UART_BEGIN/END)
+          // — merge every occurrence under the single per-symbol guard so the
+          // second block is not swallowed by the first's #define.
+          const guardName = `__TC_HW_${m[1]}_DEFINED`;
+          const existing = hardwareBlocks.get(guardName);
+          if (existing) {
+            existing.push(...guardBody.slice(i + 1, stop - 1));
+          } else {
+            hardwareBlocks.set(guardName, guardBody.slice(i, stop));
+          }
+          i = stop - 1;
+        } else {
+          genericBody.push(guardBody[i]);
+        }
+      }
+      lines.push(...preGuardLines);
       lines.push(
         '// cuttlefish runtime shim. Wrapped in a single include guard so the',
         '// block is safe to emit into multiple headers and .cpp files within',
         '// one translation unit (a .cpp may #include several headers that each',
         '// carry the shim). The guard ensures the definitions are seen exactly',
-        '// once per TU.',
+        '// once per TU. Hardware peripheral blocks are hoisted OUT of this',
+        '// guard (see the note below the DT specs).',
         '#ifndef CUTTLEFISH_SHIM_DEFINED',
         '#define CUTTLEFISH_SHIM_DEFINED',
-        ...guardBody,
+        ...genericBody,
         '#endif // CUTTLEFISH_SHIM_DEFINED',
       );
+      for (const [guardName, body] of hardwareBlocks) {
+        // The hardware scaffold is stamped per-TU BY DESIGN (each translation
+        // unit compiles standalone against its own copy), and any given TU
+        // uses only part of the block — unused-in-this-TU is EXPECTED, not a
+        // defect. Suppress the unused diagnostics for the block's extent
+        // rather than threading __attribute__((unused)) through every
+        // definition: the scaffold text stays byte-stable (the emitted-header
+        // tests pin it) and the suppression cannot leak past the block.
+        lines.push(
+          "#if defined(__GNUC__)",
+          "#pragma GCC diagnostic push",
+          '#pragma GCC diagnostic ignored "-Wunused-function"',
+          '#pragma GCC diagnostic ignored "-Wunused-variable"',
+          "#endif",
+          `#ifndef ${guardName}`,
+          `#define ${guardName}`,
+          ...body,
+          `#endif // ${guardName}`,
+          "#if defined(__GNUC__)",
+          "#pragma GCC diagnostic pop",
+          "#endif",
+        );
+      }
+      for (const body of bareBlocks) {
+        lines.push(...body);
+      }
     }
+
+    // GPIO one-shot configure latch — per PAD, program-wide. GPIO method
+    // bodies lead with a configure (the ensure-configured contract) and the
+    // OUTPUT_INIT_* level rides it as an explicit set (the ESP32 driver drops
+    // INIT_* when GPIO_INPUT rides along). The guard must fire ONCE per pad:
+    // a block-local static is per EMISSION SITE (each site is its own
+    // scope), so it re-drove the init level before every set()/toggle() — a
+    // toggle after set(true) left the pad at NOT-init. `inline` +
+    // function-local static is ONE program-wide entity (ODR), so the latch
+    // is honest across TUs and threads (a concurrent first use
+    // double-configures at worst — the same benign race a per-site static
+    // had). Out-of-range keys degrade to always-configure — the pre-latch
+    // behavior. One pad, one construction contract: the pin-mode model.
+    lines.push(
+      '#ifndef __TC_GPIO_CFG_ONCE_DEFINED',
+      '#define __TC_GPIO_CFG_ONCE_DEFINED',
+      'inline bool __tc_gpio_cfg_once(int32_t key) {',
+      '  static uint32_t seen[8] = {};',
+      '  int32_t bank = key >> 5;',
+      '  if ((bank < 0) || (bank > 7)) { return true; }',
+      '  uint32_t bit = static_cast<uint32_t>(1U) << (key & 31);',
+      '  bool first = (seen[bank] & bit) == 0U;',
+      '  seen[bank] = seen[bank] | bit;',
+      '  return first;',
+      '}',
+      '#endif // __TC_GPIO_CFG_ONCE_DEFINED',
+    );
 
     // Devicetree specs — one per board-defined GPIO pin, but ONLY for pins the
     // program actually addresses (lowerGpio routes by pin number; the
@@ -1401,12 +1693,19 @@ export class ZephyrStrategy implements PlatformStrategy {
     // precede the wiring-ambient shims and the PinGroup factory there; the
     // __tc_gpio_read body below is what still needs emitting here.)
     if (this.needsGpioReadShim(program, ctx)) {
+      // Guarded like the cfg_once helper above: these lines ride BOTH the
+      // shared shim header and each TU's own preamble, and a TU that
+      // includes the header then hits its own copy redefines them in the
+      // same translation unit (the multi-module UI demos hit exactly that).
       lines.push(
+        '#ifndef __TC_GPIO_READ_SHIM_DEFINED',
+        '#define __TC_GPIO_READ_SHIM_DEFINED',
         'inline int __tc_gpio_read(int pin) { return gpio_pin_get_raw(__tc_gpio_dev(static_cast<uint32_t>(pin)), __tc_gpio_pin(static_cast<uint32_t>(pin))); }',
         // Runtime input configuration for ui.watchPin / ui.press setup
         // (the strategy's setPinMode lowers here). Idempotent — setup calls
         // it once per watched pin before the poll loop reads it.
         'inline void __tc_gpio_configure_input(uint32_t pin) { gpio_pin_configure(__tc_gpio_dev(pin), __tc_gpio_pin(pin), GPIO_INPUT | GPIO_PULL_UP); }',
+        '#endif // __TC_GPIO_READ_SHIM_DEFINED',
       );
     }
     // __tc_gpio_write / __tc_delay_us are only referenced via @typecad/safety
@@ -1713,21 +2012,21 @@ export class ZephyrStrategy implements PlatformStrategy {
       });
     }
 
-    // ── Radio presence: family-derived, not board-curated ───────────────────
-    // Espressif ESP32 variants carry a 2.4GHz WiFi radio; every other Zephyr
-    // family in the catalog is radioless (until an Ethernet/board-wifi fact
-    // exists). Derived from the soc name — or, when no board module was
-    // generated, from the raw build target the config carries.
-    const familyTarget = `${chip.soc || ''} ${(ctx?.frameworkData as Record<string, unknown> | undefined)?.target ?? ''} ${(ctx?.frameworkData as Record<string, unknown> | undefined)?.buildTarget ?? ''}`.toLowerCase();
-    const wifiSupported = chip.wifi?.supported
-      ?? familyTarget.split(/[^a-z0-9]+/).some((t) => t.startsWith('esp32'));
+    // ── Radio presence: a harvested fact, three-state ───────────────────────
+    // The harvest reads the SoC dtsi's radio node (`wifi: wifi { compatible
+    // = "espressif,esp32-wifi" }`): true = the silicon declares the radio,
+    // false = a fresh harvest found none (radioless), undefined = no
+    // catalog backed this chip. The diagnostic only judges on an explicit
+    // no-radio FACT — absence of data (probe flows) is not a verdict; a
+    // truly radioless target fails honestly at link time.
+    const wifiSupported = chip.wifi?.supported;
 
     // ── WiFi target validity ────────────────────────────────────────────────
     // WiFi ops require a chip with a WiFi radio. The ESP32-S3 descriptor sets
     // wifi.supported; the XIAO nRF52840 omits it (no radio). Flag wifi usage on
     // a radioless chip so the user gets a clear "use an ESP32 target" message
     // instead of an opaque link/DT failure.
-    if (usesWifiOps && !wifiSupported) {
+    if (usesWifiOps && wifiSupported === false) {
       diags.push({
         severity: 'error',
         code: 'zephyr-wifi-unavailable-on-target',
@@ -1745,7 +2044,7 @@ export class ZephyrStrategy implements PlatformStrategy {
     // gets a clear "use an ESP32 target" message instead of an opaque link or
     // runtime failure. (HTTP rides over WiFi here; an Ethernet target would
     // set wifi.supported via a different transport flag if/when added.)
-    if (usesHttpOps && !wifiSupported) {
+    if (usesHttpOps && wifiSupported === false) {
       diags.push({
         severity: 'error',
         code: 'zephyr-http-unavailable-on-target',
@@ -1758,7 +2057,7 @@ export class ZephyrStrategy implements PlatformStrategy {
     // ── MQTT target validity ─────────────────────────────────────────────
     // Same constraint as HTTP: MQTT needs a network transport to reach a broker.
     // Flag mqtt usage on a radioless chip so the user picks a networked target.
-    if (usesMqttOps && !wifiSupported) {
+    if (usesMqttOps && wifiSupported === false) {
       diags.push({
         severity: 'error',
         code: 'zephyr-mqtt-unavailable-on-target',
@@ -1842,9 +2141,23 @@ export class ZephyrStrategy implements PlatformStrategy {
   // ── Type normalisation ──────────────────────────────────────────────────
 
   normalizeCppType(typeName: string): string {
+    // ONE string model: std::string end to end (variables, container
+    // elements, helper returns). Zephyr links with REQUIRES_FULL_LIBCPP, so
+    // the hosted model applies unchanged — literals convert implicitly on
+    // the way in, and .c_str() appears only at C-varargs boundaries (the
+    // snprintf builders handle that via needsCStrForStringLike). The former
+    // const char* model (every value a ring-buffer pointer) aliased
+    // whenever more results were live than ring slots and is gone.
     if (typeName === 'auto') return 'auto';
-    if (typeName === 'std::string') return 'const char*';
     return typeName;
+  }
+
+  promoteDivisionToDouble(): boolean {
+    // JS `/` is real division even for int operands — ZephyrStrategy
+    // implements PlatformStrategy directly (no GenericPlatformStrategy
+    // inheritance), so without this override the emit-side promotion never
+    // ran and `sum / n` truncated as C++ integer division.
+    return true;
   }
 
   defaultNumericType(compliance?: { isBanned(ruleId: string): boolean }): string {
@@ -1878,21 +2191,14 @@ export class ZephyrStrategy implements PlatformStrategy {
     let v = value;
     while (prev !== v) {
       prev = v;
-      v = v.replace(/\bundefined\b/g, 'CUTTLEFISH_UNDEFINED');
-      v = v.replace(/\bnull\b/g, 'CUTTLEFISH_UNDEFINED');
+      v = replaceOutsideStringLiterals(v, /\bundefined\b/g, 'CUTTLEFISH_UNDEFINED'); // quote-aware: blanket rewrote literal content
+      v = replaceOutsideStringLiterals(v, /\bnull\b/g, 'CUTTLEFISH_UNDEFINED');
     }
     // String-method lowering is shared across targets (see string-method-
-    // registry). Zephyr's strings are const char*, so the __tc_* helpers this
-    // rewrites to (defined by the string_methods polyfill) take const char*.
-    // includes/startsWith lower to inline strstr/strncmp (matching framework-
-    // arduino); everything else → a __tc_* helper call.
-    v = applyStringMethodRewrites(v, {
-      wrapReceiverFor: new Set(['indexOf']),
-      special: {
-        includes: (recv, args) => `(strstr(${recv}, ${args[0]}) != NULL)`,
-        startsWith: (recv, args) => `(strncmp(${recv}, ${args[0]}, strlen(${args[0]})) == 0)`,
-      },
-    });
+    // registry). Every helper takes `const std::string&` (a literal converts
+    // implicitly), so every method routes through a helper — no receiver
+    // wrapping and no inline strstr/strncmp forms.
+    v = applyStringMethodRewrites(v, {});
     return v;
   }
 
@@ -2032,6 +2338,26 @@ export class ZephyrStrategy implements PlatformStrategy {
     ]);
   }
 
+  // Which semantic HAL functions register a callback that runs in TRUE
+  // Zephyr interrupt context. This is platform DATA, not engine knowledge:
+  // the engine cannot know that a counter alarm fires in ISR while a thread
+  // entry does not — the Zephyr API contracts say so.
+  //   interruptAttachFlags → gpio_pin_interrupt_configure + gpio_init_callback:
+  //     the ISR runs on the driver's IRQ path.
+  //   counterOnAlarm → counter_set_top_value's counter_top_cfg callback:
+  //     the Zephyr counter driver invokes it from the timer ISR (or the ISR
+  //     it chains to).
+  // Deliberately absent: threadStart (k_thread entry — a schedulable
+  // thread), the WiFi/BLE event registrations (event-loop context), and
+  // every std::function-style task form. Marking those ISR would pin
+  // their bodies into IRAM and mis-run the volatile/unsafe-op analyses.
+  isrCallbackSemanticFns(): string[] {
+    return [
+      'interruptAttachFlags',
+      'counterOnAlarm',
+    ];
+  }
+
   ambientTypeDeclarations(): string[] {
     // Preferences is the only HAL surface the framework lowers that is used as
     // a bare global (the HAL Preferences class is exported, but the canonical
@@ -2078,8 +2404,11 @@ export class ZephyrStrategy implements PlatformStrategy {
   }
 
   needsStdVector(): boolean {
-    // No <vector> in the minimal C++ lib.
-    return false;
+    // <vector> IS available: builds run with CONFIG_REQUIRES_FULL_LIBCPP
+    // (real libstdc++ — same reasoning as mathHeader below). The former
+    // `false` left the typed `new Array<E>(n)` lowering (std::vector<E>)
+    // without its include — uncompilable output, silently.
+    return true;
   }
 
   needsStdExcept(): boolean {
@@ -2143,10 +2472,10 @@ export class ZephyrStrategy implements PlatformStrategy {
    */
   generateBoardModule(
     target: string,
-    opts?: { factsJson?: string; asBuiltJson?: string },
+    opts?: { factsJson?: string; asBuiltJson?: string; busPins?: Record<string, Record<string, number>> },
   ): { boardTs: string; boardJson: string; warnings?: readonly string[] } | undefined {
     try {
-      const g = generateBoard(target, { factsJson: opts?.factsJson, asBuiltJson: opts?.asBuiltJson });
+      const g = generateBoard(target, { factsJson: opts?.factsJson, asBuiltJson: opts?.asBuiltJson, busPins: opts?.busPins });
       return { boardTs: g.boardTs, boardJson: g.boardJson, ...(g.warnings ? { warnings: g.warnings } : {}) };
     } catch (err) {
       // A malformed facts/as-built file is the USER's error — surface it
@@ -2176,11 +2505,15 @@ export class ZephyrStrategy implements PlatformStrategy {
     return ensureFreshBoardCatalog();
   }
 
-  asyncLoopInjection(taskVarNames: string[], config: AsyncRuntimeConfig): string[];
-  asyncLoopInjection(taskVarNames: string[], hasPromiseRuntime: boolean, hasTimers: boolean): string[];
+  asyncLoopInjection(taskVarNames: string[], config: AsyncRuntimeConfig, extraInLoopBodies?: string[]): string[];
+  // (The legacy boolean overload `(taskVarNames, hasPromiseRuntime, hasTimers)`
+  // was removed when `extraInLoopBodies` took the third parameter slot — no
+  // caller passed the boolean form, and it no longer typechecked against the
+  // implementation.)
   asyncLoopInjection(
     taskVarNames: string[],
     configOrBool: AsyncRuntimeConfig | boolean,
+    extraInLoopBodies?: string[],
     _hasTimers?: boolean,
   ): string[] {
     const cfg =
@@ -2200,6 +2533,8 @@ export class ZephyrStrategy implements PlatformStrategy {
     for (const n of taskVarNames) {
       work.push(`${n}.run();`);
     }
+    // Cross-module task pump calls (see transpile.ts crossModuleAsyncTasks).
+    work.push(...(extraInLoopBodies ?? []));
     // NOTE: no timer-queue poll — periodic work is a Thread (k_thread) or a
     // Counter (hardware timer), never a cooperative poll.
     //
@@ -2291,28 +2626,32 @@ export class ZephyrStrategy implements PlatformStrategy {
   }
 
   getStdLibSupport(_architecture?: string): StdLibSupport {
-    // Zephyr's minimal C++ support (lib/cpp/minimal) provides only <cstddef>,
-    // <cstdint>, <new>. No <vector>, <string>, <iostream>, <functional>, no
-    // exceptions, no RTTI. The blink MVP uses only GPIO + kernel timing, so
-    // none of those are needed. Array/string literals are not promoted to the
-    // STL containers; a future program needing them must enable a full STL
-    // and update these flags.
+    // Builds run with CONFIG_REQUIRES_FULL_LIBCPP (real libstdc++), so
+    // <vector> is available (needsStdVector above). The remaining flags
+    // describe what the lowerings actually use: no <string>/<iostream>/
+    // <functional>, no exceptions, no RTTI.
     return {
-      hasVector: false,
+      hasVector: true,
       hasString: false,
       hasIostream: false,
       hasExceptions: false,
       hasRTTI: false,
       recommendedArrayImpl: 'static_array',
-      recommendedStringImpl: 'static_string',
-    };
+      recommendedStringImpl: 'static_string',    };
+  }
+
+  supportsStdVariant(): boolean {
+    // The scaffold pins CONFIG_STD_CPP14 — <variant> ships in the full
+    // libstdc++ headers but does not compile under C++14. Unrelated to
+    // hasVector: the library is present; the standard is not.
+    return false;
   }
 
   // ── Polyfills ───────────────────────────────────────────────────────────
-  // Zephyr is a no-STL target (hasVector/hasString = false), so array/string
-  // literals lower to __tc_StaticArray / const char* and string methods lower
-  // to __tc_* helpers — both need STL-free definitions emitted here (there is
-  // no shared-runtime fallback; the pipeline sources 100% of polyfills from
+  // Array/string literals lower to __tc_StaticArray / const char* and string
+  // methods lower to __tc_* helpers — both need STL-free definitions emitted
+  // here (there is no shared-runtime fallback; the pipeline sources 100% of
+  // polyfills from
   // generateNativePolyfills). Mirrors framework-arduino's AVR polyfills.
 
   nativePolyfills(): Set<string> {
@@ -2390,44 +2729,105 @@ export class ZephyrStrategy implements PlatformStrategy {
         kind: 'polyfill',
         id: 'string_methods',
         domain: 'embedded' as const,
-        requiredIncludes: ['<cstring>'],
+        requiredIncludes: ['<cstring>', '<string>', '<vector>', '<cmath>'],  // <cmath>: __tc_toFixed rounds via floor
         forwardDeclarations: [],
         helperStructs: [],
         helperFunctions: [`
-// TypeCAD string method polyfills (Zephyr, minimal-libc).
-#ifndef CUTTLEFISH_STR_BUF_SIZE
-#define CUTTLEFISH_STR_BUF_SIZE 64
-#endif
-bool __tc_endsWith(const char* s, const char* suffix) { int sl = strlen(s), tl = strlen(suffix); return sl >= tl && strcmp(s + sl - tl, suffix) == 0; }
-const char* __tc_toUpperCase(const char* s) { static char buf[2][CUTTLEFISH_STR_BUF_SIZE]; static uint8_t slot = 0; slot ^= 1; char* b = buf[slot]; strncpy(b, s, CUTTLEFISH_STR_BUF_SIZE - 1); b[CUTTLEFISH_STR_BUF_SIZE - 1] = '\\0'; for (char* p = b; *p; p++) { if (*p >= 'a' && *p <= 'z') { *p = static_cast<char>(*p - 32); } } return b; }
-const char* __tc_toLowerCase(const char* s) { static char buf[2][CUTTLEFISH_STR_BUF_SIZE]; static uint8_t slot = 0; slot ^= 1; char* b = buf[slot]; strncpy(b, s, CUTTLEFISH_STR_BUF_SIZE - 1); b[CUTTLEFISH_STR_BUF_SIZE - 1] = '\\0'; for (char* p = b; *p; p++) { if (*p >= 'A' && *p <= 'Z') { *p = static_cast<char>(*p + 32); } } return b; }
-const char* __tc_trim(const char* s) { static char buf[2][CUTTLEFISH_STR_BUF_SIZE]; static uint8_t slot = 0; slot ^= 1; char* b = buf[slot]; while (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r') s++; int len = strlen(s); while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\\t' || s[len-1] == '\\n' || s[len-1] == '\\r')) len--; int cplen = len < CUTTLEFISH_STR_BUF_SIZE - 1 ? len : CUTTLEFISH_STR_BUF_SIZE - 1; strncpy(b, s, cplen); b[cplen] = '\\0'; return b; }
-const char* __tc_substring2(const char* s, int start, int end) { static char buf[2][CUTTLEFISH_STR_BUF_SIZE]; static uint8_t slot = 0; slot ^= 1; char* b = buf[slot]; int slen = strlen(s); if (start < 0) start = 0; if (end > slen) end = slen; if (end < start) end = start; int len = end - start; if (len >= CUTTLEFISH_STR_BUF_SIZE) len = CUTTLEFISH_STR_BUF_SIZE - 1; strncpy(b, s + start, len); b[len] = '\\0'; return b; }
-const char* __tc_substring1(const char* s, int start) { return __tc_substring2(s, start, strlen(s)); }
-const char* __tc_slice2(const char* s, int start, int end) { return __tc_substring2(s, start, end); }
-const char* __tc_slice1(const char* s, int start) { return __tc_substring2(s, start, strlen(s)); }
-const char* __tc_replace(const char* s, const char* old, const char* repl) { static char buf[2][CUTTLEFISH_STR_BUF_SIZE]; static uint8_t slot = 0; slot ^= 1; char* b = buf[slot]; const char* pos = strstr(s, old); if (!pos) { strncpy(b, s, CUTTLEFISH_STR_BUF_SIZE - 1); b[CUTTLEFISH_STR_BUF_SIZE - 1] = '\\0'; return b; } int beforeLen = static_cast<int>(pos - s); int oldLen = static_cast<int>(strlen(old)); int replLen = static_cast<int>(strlen(repl)); if (beforeLen + replLen + static_cast<int>(strlen(pos + oldLen)) >= CUTTLEFISH_STR_BUF_SIZE) { strncpy(b, s, CUTTLEFISH_STR_BUF_SIZE - 1); b[CUTTLEFISH_STR_BUF_SIZE - 1] = '\\0'; return b; } memcpy(b, s, beforeLen); memcpy(b + beforeLen, repl, replLen); strcpy(b + beforeLen + replLen, pos + oldLen); return b; }
-const char* __tc_charAt(const char* s, int idx) { static char buf[2][2]; static uint8_t slot = 0; slot ^= 1; buf[slot][0] = s[idx]; buf[slot][1] = '\\0'; return buf[slot]; }
-int __tc_charCodeAt(const char* s, int idx) { return static_cast<int>(static_cast<unsigned char>(s[idx])); }
-int __tc_indexOf(const char* s, const char* needle) { const char* p = strstr(s, needle); return p ? static_cast<int>(p - s) : -1; }
+// TypeCAD string method polyfills (Zephyr, full libcpp).
+//
+// ONE string model: every helper takes "const std::string&" (a const char*
+// literal converts implicitly) and returns std::string BY VALUE. The old
+// const char* + rotating-static-ring model aliased whenever more results
+// were live than ring slots (a status line with four __tc_toFixed calls
+// printed the setpoint for the temperature) and self-read UB in (s += x) accumulators
+// accumulators; by-value returns delete that whole bug class. Zephyr links
+// with REQUIRES_FULL_LIBCPP, and short results ride std::string's SSO, so
+// typical fixed-point formatting never touches the heap.
+inline bool __tc_endsWith(const std::string& s, const std::string& suffix) { size_t n = suffix.size(); return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0; }
+inline bool __tc_startsWith(const std::string& s, const std::string& prefix) { size_t n = prefix.size(); return s.size() >= n && s.compare(0, n, prefix) == 0; }
+inline bool __tc_includes(const std::string& s, const std::string& needle) { return s.find(needle) != std::string::npos; }
+// (3.14159).toFixed(2) → "3.14". %.*f needs CBPRINTF_FP_SUPPORT — the usage
+// scan flags __tc_toFixed( as a float-format site so the scaffold turns it
+// on. Digits are clamped so a bad input cannot balloon the fixed-point
+// expansion past the stack buffer (snprintf truncates safely beyond it).
+//
+// JS toFixed: n/10^d closest to the EXACT binary value, ties -> away from
+// zero. printf uses half-even. Differ ONLY at exact decimal ties. Detect
+// via scaled - floor(scaled) == 0.5, VERIFIED by reconstructing val from
+// the scaled integers (a double multiply creates false ties: 2.775*100
+// rounds to exactly 277.5 while the true value is 277.4999...; the
+// reconstruction 277/100 + 0.005 != 2.775 rejects it). Nudge away from
+// zero by half a unit in the last place, then printf.
+// NOTE: this helper must stay multi-line — an earlier single-line form
+// carried "//" comments INSIDE the body, which commented out everything
+// after them (body and closing brace included) and unbalanced every header
+// that defined the helper.
+inline std::string __tc_toFixed(double val, int digits) {
+    if (digits < 0) { digits = 0; }
+    if (digits > 20) { digits = 20; }
+    double scale = 1.0;
+    for (int i = 0; i < digits; i++) { scale *= 10.0; }
+    double scaled = val * scale;
+    if (scaled - floor(scaled) == 0.5 && val == floor(scaled) / scale + 0.5 / scale) {
+        val += (val < 0 ? -0.5 : 0.5) / scale;
+    }
+    char b[340];
+    snprintf(b, sizeof(b), "%.*f", digits, val);
+    return std::string(b);
+}
+inline std::string __tc_toUpperCase(const std::string& s) { std::string r = s; for (char& c : r) { if (c >= 'a' && c <= 'z') { c = static_cast<char>(c - 32); } } return r; }
+inline std::string __tc_toLowerCase(const std::string& s) { std::string r = s; for (char& c : r) { if (c >= 'A' && c <= 'Z') { c = static_cast<char>(c + 32); } } return r; }
+inline std::string __tc_trim(const std::string& s) { const char* ws = " \\t\\n\\r" ; size_t b = s.find_first_not_of(ws); if (b == std::string::npos) { return std::string(); } size_t e = s.find_last_not_of(ws); return s.substr(b, (e - b) + 1U); }
+inline std::string __tc_substring2(const std::string& s, int start, int end) { int slen = static_cast<int>(s.size()); if (start < 0) { start = 0; } if (end > slen) { end = slen; } if (end < start) { end = start; } return s.substr(static_cast<size_t>(start), static_cast<size_t>(end - start)); }
+inline std::string __tc_substring1(const std::string& s, int start) { return __tc_substring2(s, start, static_cast<int>(s.size())); }
+inline std::string __tc_slice2(const std::string& s, int start, int end) { return __tc_substring2(s, start, end); }
+inline std::string __tc_slice1(const std::string& s, int start) { return __tc_substring2(s, start, static_cast<int>(s.size())); }
+// JS String.replace with two STRING args replaces the FIRST occurrence only.
+inline std::string __tc_replace(const std::string& s, const std::string& old, const std::string& repl) { size_t p = s.find(old); if (p == std::string::npos) { return s; } std::string r = s; r.replace(p, old.size(), repl); return r; }
+inline std::string __tc_charAt(char c, int idx) { (void)idx; return std::string(1U, c); }
+inline std::string __tc_charAt(const std::string& s, int idx) { if (idx < 0 || static_cast<size_t>(idx) >= s.size()) { return std::string(); } return std::string(1U, s[static_cast<size_t>(idx)]); }
+inline int __tc_charCodeAt(char c, int idx) { (void)idx; return static_cast<int>(static_cast<unsigned char>(c)); }
+inline int __tc_charCodeAt(const std::string& s, int idx) { if (idx < 0 || static_cast<size_t>(idx) >= s.size()) { return 0; } return static_cast<int>(static_cast<unsigned char>(s[static_cast<size_t>(idx)])); }
+inline int __tc_indexOf(const std::string& s, const std::string& needle) { size_t p = s.find(needle); return (p == std::string::npos) ? -1 : static_cast<int>(p); }
+inline int __tc_lastIndexOf(const std::string& s, const std::string& needle) { size_t p = s.rfind(needle); return (p == std::string::npos) ? -1 : static_cast<int>(p); }
+inline std::string __tc_padStart(const std::string& s, int len, const char* fill) { size_t flen = strlen(fill); if (flen == 0U) { flen = 1U; } int slen = static_cast<int>(s.size()); if (len <= slen) { return s; } std::string r; size_t pad = static_cast<size_t>(len - slen); for (size_t i = 0U; i < pad; i++) { r.push_back(fill[i % flen]); } r.append(s); return r; }
+inline std::string __tc_padStart_default(const std::string& s, int len) { return __tc_padStart(s, len, " "); }
+inline std::string __tc_padEnd(const std::string& s, int len, const char* fill) { size_t flen = strlen(fill); if (flen == 0U) { flen = 1U; } int slen = static_cast<int>(s.size()); if (len <= slen) { return s; } std::string r = s; size_t pad = static_cast<size_t>(len - slen); for (size_t i = 0U; i < pad; i++) { r.push_back(fill[i % flen]); } return r; }
+inline std::string __tc_padEnd_default(const std::string& s, int len) { return __tc_padEnd(s, len, " "); }
+inline std::string __tc_repeat(const std::string& s, int count) { std::string r; if (count > 0) { for (int i = 0; i < count; i++) { r.append(s); } } return r; }
+// Split on a delimiter. JS semantics: an empty delimiter splits into single
+// characters; the trailing empty part is kept.
+inline std::vector<std::string> __tc_split(const std::string& s, const std::string& delim) { std::vector<std::string> parts; if (delim.empty()) { for (size_t i = 0U; i < s.size(); i++) { parts.push_back(s.substr(i, 1U)); } return parts; } size_t dl = delim.size(); size_t start = 0U; size_t p = s.find(delim, start); while (p != std::string::npos) { parts.push_back(s.substr(start, p - start)); start = p + dl; p = s.find(delim, start); } parts.push_back(s.substr(start)); return parts; }
+inline std::string __tc_num_radix(long long v, int radix) { char b[72]; if (radix == 16) { snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(v)); } else if (radix == 8) { snprintf(b, sizeof(b), "%llo", static_cast<unsigned long long>(v)); } else if (radix == 2) { unsigned long long u = static_cast<unsigned long long>(v); char tmp[72]; int i = 0; if (u == 0ULL) { b[0] = '0'; b[1] = '\\0'; return std::string(b); } while (u > 0ULL) { tmp[i++] = static_cast<char>('0' + static_cast<char>(u & 1ULL)); u >>= 1U; } for (int j = 0; j < i; j++) { b[j] = tmp[i - 1 - j]; } b[i] = '\\0'; } else { snprintf(b, sizeof(b), "%lld", v); } return std::string(b); }
+// JS String(v) for a template interpolation flattened at IR time (a template
+// literal used as a map key): integers bare, fraction trimmed — the same
+// number rendering as the runtime shim's __tc_fmt_num_buf, INLINED here so
+// the helper is self-contained (the string_methods polyfill can be emitted
+// into a header TU that does not carry the runtime shim).
+inline std::string __tc_numToStr_js(double v) { char b[32]; if (v != v) { snprintf(b, sizeof(b), "nan"); return std::string(b); } double a = v < 0 ? -v : v; long long ip = static_cast<long long>(a); long long fr = static_cast<long long>((a - static_cast<double>(ip)) * 1000000.0 + 0.5); if (fr >= 1000000LL) { ip += 1LL; fr = 0LL; } int used = 0; if (v < 0 && (ip != 0LL || fr != 0LL)) { b[used++] = '-'; } if (fr == 0LL) { b[used] = '\\0'; snprintf(b + used, sizeof(b) - static_cast<size_t>(used), "%lld", ip); return std::string(b); } char fbuf[8]; int len = snprintf(fbuf, sizeof(fbuf), "%06lld", fr); while (len > 0 && fbuf[len - 1] == '0') { fbuf[--len] = '\\0'; } b[used] = '\\0'; snprintf(b + used, sizeof(b) - static_cast<size_t>(used), "%lld.%s", ip, fbuf); return std::string(b); }
+
 `],
         shimMacros: [],
         dependencies: [],
       },
       {
-        // STL-free fixed-size array wrapper. Mutated/struct-element array
-        // literals and array methods (.push/.pop/.map/.filter) lower to
-        // __tc_StaticArray<T,N>; this supplies the template. Idempotent guard
-        // so a redefinition is a no-op. Mirrors framework-arduino.
+        // Fixed-size array wrapper. Mutated/struct-element array literals and
+        // array methods (.push/.pop/.map/.filter) lower to __tc_StaticArray<T,N>;
+        // this supplies the template. Idempotent guard so a redefinition is a
+        // no-op. `join` returns std::string (the one string model) — hence the
+        // <string> include.
         kind: 'polyfill',
         id: 'static_array',
         domain: 'embedded' as const,
-        requiredIncludes: [],
+        requiredIncludes: ['<string>'],
         forwardDeclarations: [],
         helperStructs: [],
         helperFunctions: [`
 #ifndef __TC_STATIC_ARRAY_DEFINED
 #define __TC_STATIC_ARRAY_DEFINED
+inline std::string __tc_join_elem(const std::string& v) { return v; }
+inline std::string __tc_join_elem(const char* v) { return std::string(v); }
+inline std::string __tc_join_elem(double v) { char b[32]; (void)snprintf(b, sizeof(b), "%g", v); return std::string(b); }
 template<typename T, int N>
 struct __tc_StaticArray {
     T data[N];
@@ -2438,6 +2838,13 @@ struct __tc_StaticArray {
     void push(T val) { if (_size < N) data[_size++] = val; }
     T pop() { return (_size > 0) ? data[--_size] : T(); }
     int indexOf(T val) const { for (int i = 0; i < _size; i++) if (data[i] == val) return i; return -1; }
+    __tc_StaticArray& fill(T val) { for (int i = 0; i < _size; i++) data[i] = val; return *this; }
+    __tc_StaticArray& fill(T val, int start, int end) { if (start < 0) start = 0; if (end > _size) end = _size; if (end < start) end = start; for (int i = start; i < end; i++) data[i] = val; return *this; }
+    T shift() { if (_size == 0) return T(); T v = data[0]; for (int i = 1; i < _size; i++) data[i - 1] = data[i]; _size--; return v; }
+    int unshift(T val) { if (_size < N) { for (int i = _size; i > 0; i--) data[i] = data[i - 1]; data[0] = val; _size++; } return _size; }
+    bool includes(T val) const { return indexOf(val) != -1; }
+    int lastIndexOf(T val) const { for (int i = _size - 1; i >= 0; i--) if (data[i] == val) return i; return -1; }
+    std::string join(const std::string& delim) const { std::string out; for (int i = 0; i < _size; i++) { if (i > 0) { out += delim; } out += __tc_join_elem(data[i]); } return out; }
     T& operator[](int i) { return data[i]; }
     const T& operator[](int i) const { return data[i]; }
     T* begin() { return &data[0]; }
@@ -2445,6 +2852,126 @@ struct __tc_StaticArray {
     const T* begin() const { return &data[0]; }
     const T* end() const { return &data[_size]; }
 };
+#endif
+`],
+        shimMacros: [],
+        dependencies: [],
+      },
+      {
+        // Vector helpers for std::vector receivers (annotated `T[]`
+        // declarations lower to std::vector on Zephyr — only array literals
+        // become __tc_StaticArray). `.includes`/`.indexOf` on those lower to
+        // these template overloads (`.push` inlines to push_back at IR time).
+        // `__tc_join` folds elements into a std::string (the one string
+        // model) — loop-pushed arrays route here because their capacity is
+        // unbounded, so they stay std::vector rather than promoting to
+        // __tc_StaticArray (whose join member is the bounded twin).
+        // Separate polyfill so the <vector> include only follows actual
+        // vector-helper use. AUTOSAR: fixed-form templates, no dynamic
+        // allocation — a bounded linear scan, same shape as __tc_StaticArray's
+        // indexOf.
+        kind: 'polyfill',
+        id: 'vector_methods',
+        domain: 'embedded' as const,
+        requiredIncludes: ['<vector>', '<string>', '<algorithm>', '<map>', '<set>', '<utility>'],
+        forwardDeclarations: [],
+        helperStructs: [],
+        helperFunctions: [`
+#ifndef __TC_VECTOR_METHODS_DEFINED
+#define __TC_VECTOR_METHODS_DEFINED
+inline std::string __tc_join_vecelem(const std::string& v) { return v; }
+inline std::string __tc_join_vecelem(const char* v) { return std::string(v); }
+inline std::string __tc_join_vecelem(double v) { char b[32]; (void)snprintf(b, sizeof(b), "%g", v); return std::string(b); }
+template <typename T, typename U>
+int __tc_indexOf(const std::vector<T>& v, const U& val) { for (size_t i = 0; i < v.size(); i++) { if (v[i] == static_cast<T>(val)) { return static_cast<int>(i); } } return -1; }
+template <typename T, typename U>
+bool __tc_includes(const std::vector<T>& v, const U& val) { for (size_t i = 0; i < v.size(); i++) { if (v[i] == static_cast<T>(val)) { return true; } } return false; }
+template <typename T>
+std::string __tc_join(const std::vector<T>& v, const std::string& delim) { std::string out; for (size_t i = 0; i < v.size(); i++) { if (i > 0U) { out += delim; } out += __tc_join_vecelem(v[i]); } return out; }
+// JS slice on a vector: negative start counts from the end, start beyond the
+// size yields an empty vector (a fresh vector each call — JS value
+// semantics).
+template <typename T>
+std::vector<T> __tc_slice1(const std::vector<T>& v, int start) { int n = static_cast<int>(v.size()); if (start < 0) { start += n; } if (start < 0) { start = 0; } if (start > n) { start = n; } return std::vector<T>(v.begin() + start, v.end()); }
+template <typename T>
+std::vector<T> __tc_slice2(const std::vector<T>& v, int start, int end) { int n = static_cast<int>(v.size()); if (start < 0) { start += n; } if (end < 0) { end += n; } if (start < 0) { start = 0; } if (end > n) { end = n; } if (end < start) { end = start; } return std::vector<T>(v.begin() + start, v.begin() + end); }
+// JS Array mutators with JS return contracts (pop/shift return the removed
+// element, unshift the new length) — std::vector has pop_back/push_back but
+// no shift/unshift/reverse members, and a bare .pop() returns void.
+// Bounded scans/swaps, no allocation beyond the vector's own growth.
+template <typename T>
+T __tc_pop(std::vector<T>& v) { if (v.empty()) { return T(); } T val = v.back(); v.pop_back(); return val; }
+template <typename T>
+T __tc_shift(std::vector<T>& v) { if (v.empty()) { return T(); } T val = v.front(); v.erase(v.begin()); return val; }
+template <typename T>
+int __tc_unshift(std::vector<T>& v, const T& val) { v.insert(v.begin(), val); return static_cast<int>(v.size()); }
+template <typename T>
+void __tc_reverse(std::vector<T>& v) { size_t i = 0U; size_t j = v.size(); while (j > (i + 1U)) { j -= 1U; T tmp = v[i]; v[i] = v[j]; v[j] = tmp; i += 1U; } }
+// JS callback-arg array methods on std::vector receivers. The IR lowering
+// (VECTOR_CALLBACK_METHOD_HELPERS) emits these call sites on EVERY
+// vector-capable target — until now only the hosted shim defined them, so
+// sort(fn)/map(fn)/filter(fn) call sites on Zephyr hit the static-array
+// unsupported gate even though the target ships vectors.
+// JS semantics: a comparator returns <0 to order a before b; find returns a
+// value-initialized T() for "not found"; map's element type is deduced from
+// the callable's return (decltype is unevaluated — v[0] never executes).
+template <typename T, typename F>
+void __tc_sort_fn(std::vector<T>& v, F comp) { std::sort(v.begin(), v.end(), [&comp](const T& a, const T& b) { return comp(a, b) < 0; }); }
+template <typename T, typename F>
+std::vector<T> __tc_filter(const std::vector<T>& v, F pred) { std::vector<T> result; for (size_t i = 0U; i < v.size(); i++) { if (pred(v[i])) { result.push_back(v[i]); } } return result; }
+template <typename T, typename F>
+auto __tc_map(const std::vector<T>& v, F fn) -> std::vector<decltype(fn(v[0]))> { using R = decltype(fn(v[0])); std::vector<R> result; for (size_t i = 0U; i < v.size(); i++) { result.push_back(fn(v[i])); } return result; }
+template <typename T, typename U, typename F>
+U __tc_reduce(const std::vector<T>& v, F fn, U init) { U acc = init; for (size_t i = 0U; i < v.size(); i++) { acc = fn(acc, v[i]); } return acc; }
+template <typename T, typename F>
+T __tc_reduce_no_init(std::vector<T>& v, F fn) { T acc = v[0]; for (size_t i = 1U; i < v.size(); i++) { acc = fn(acc, v[i]); } return acc; }
+template <typename T, typename F>
+T __tc_find(const std::vector<T>& v, F pred) { for (size_t i = 0U; i < v.size(); i++) { if (pred(v[i])) { return v[i]; } } return T(); }
+template <typename T, typename F>
+int __tc_findIndex(const std::vector<T>& v, F pred) { for (int i = 0; i < static_cast<int>(v.size()); i++) { if (pred(v[static_cast<size_t>(i)])) { return i; } } return -1; }
+template <typename T, typename F>
+bool __tc_every(const std::vector<T>& v, F pred) { for (size_t i = 0U; i < v.size(); i++) { if (!pred(v[i])) { return false; } } return true; }
+template <typename T, typename F>
+bool __tc_some(const std::vector<T>& v, F pred) { for (size_t i = 0U; i < v.size(); i++) { if (pred(v[i])) { return true; } } return false; }
+// Bare sort (no comparator): matches the hosted shim's member-order form.
+template <typename T>
+void __tc_sort(std::vector<T>& v) { std::sort(v.begin(), v.end()); }
+// JS concat/fill/splice on std::vector receivers (the structural lowering
+// emits these for any vector-capable target).
+template <typename T>
+std::vector<T> __tc_concat(const std::vector<T>& a, const std::vector<T>& b) { std::vector<T> out = a; for (size_t i = 0U; i < b.size(); i++) { out.push_back(b[i]); } return out; }
+template <typename T>
+void __tc_fill(std::vector<T>& v, const T& val) { for (size_t i = 0U; i < v.size(); i++) { v[i] = val; } }
+template <typename T>
+void __tc_fill3(std::vector<T>& v, const T& val, int start, int end) { int n = static_cast<int>(v.size()); if (start < 0) { start += n; } if (end < 0) { end += n; } if (start < 0) { start = 0; } if (end > n) { end = n; } for (int i = start; i < end; i++) { v[static_cast<size_t>(i)] = val; } }
+template <typename T>
+std::vector<T> __tc_splice1(std::vector<T>& v, int start) { std::vector<T> removed(v.begin() + start, v.end()); v.erase(v.begin() + start, v.end()); return removed; }
+template <typename T>
+std::vector<T> __tc_splice2(std::vector<T>& v, int start, int deleteCount) { int n = static_cast<int>(v.size()); if (start < 0) { start += n; } int end = start + deleteCount; if (end > n) { end = n; } if (start < 0) { start = 0; } if (end < start) { end = start; } std::vector<T> removed(v.begin() + start, v.begin() + end); v.erase(v.begin() + start, v.begin() + end); return removed; }
+// Object.keys/values/entries + Set.values/entries over std::map/std::set.
+template <typename K, typename V>
+std::vector<K> __tc_mapKeys(const std::map<K, V>& m) { std::vector<K> keys; for (const auto& pair : m) { keys.push_back(pair.first); } return keys; }
+template <typename K, typename V>
+std::vector<V> __tc_mapValues(const std::map<K, V>& m) { std::vector<V> vals; for (const auto& pair : m) { vals.push_back(pair.second); } return vals; }
+template <typename K, typename V>
+std::vector<std::pair<K, V>> __tc_mapEntries(const std::map<K, V>& m) { std::vector<std::pair<K, V>> entries; for (const auto& pair : m) { entries.push_back(pair); } return entries; }
+template <typename T>
+std::vector<T> __tc_setValues(const std::set<T>& sset) { std::vector<T> vals; for (const auto& item : sset) { vals.push_back(item); } return vals; }
+template <typename T>
+std::vector<std::pair<T, T>> __tc_setEntries(const std::set<T>& sset) { std::vector<std::pair<T, T>> entries; for (const auto& item : sset) { entries.push_back(std::pair<T, T>(item, item)); } return entries; }
+template <typename K, typename V>
+std::map<K, V> __tc_fromEntries(const std::vector<std::pair<K, V>>& entries) { std::map<K, V> out; for (const auto& pair : entries) { out[pair.first] = pair.second; } return out; }
+// JSON.* - stringify of a string is the string; other scalars to text.
+inline std::string __tc_jsonStringify(const std::string& s) { return s; }
+template <typename T>
+std::string __tc_jsonStringify(const T& v) { char b[32]; (void)snprintf(b, sizeof(b), "%g", static_cast<double>(v)); return std::string(b); }
+inline std::string __tc_jsonParse(const std::string& s) { return s; }
+// Math.max(...vals) / Math.min(...vals) — the variadic fold over an array.
+// Same empty-input convention as __tc_reduce_no_init (v[0]).
+template <typename T>
+T __tc_max_vec(const std::vector<T>& v) { T m = v[0]; for (size_t i = 1U; i < v.size(); i++) { if (v[i] > m) { m = v[i]; } } return m; }
+template <typename T>
+T __tc_min_vec(const std::vector<T>& v) { T m = v[0]; for (size_t i = 1U; i < v.size(); i++) { if (v[i] < m) { m = v[i]; } } return m; }
 #endif
 `],
         shimMacros: [],
@@ -2481,8 +3008,17 @@ struct __tc_StaticArray {
 
   // ── HAL ──────────────────────────────────────────────────────────────────
 
-  resolveHALOperation(op: HALOpIR): { code?: string; expression?: string } | undefined {
+  resolveHALOperation(
+    op: HALOpIR,
+  ): { code?: string; expression?: string; markers?: readonly string[] } | undefined {
     return lowerHalOp(op);
+  }
+
+  /** Op → C++ return types, declared beside each lowering (lowering/op-types.ts
+   *  merges them). The engine's printf-specifier ladders consume this through
+   *  the PlatformHALStrategy seam — the engine's own table is only a fallback. */
+  halOpCppType(operation: string): string | undefined {
+    return ZEPHYR_OP_CPP_RETURN_TYPES[operation];
   }
 
   modelsGpio(): boolean {

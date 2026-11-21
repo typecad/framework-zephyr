@@ -89,3 +89,12 @@ export function lowerClock(op: HALOpIR): { code?: string; expression?: string } 
       );
   }
 }
+
+
+// ── Op C++ return types (the single definition site) ─────────────────────
+// Beside the lowering case that emits it; served to the engine via the
+// strategy's halOpCppType seam (see wifi.ts for the contract).
+export const OP_CPP_RETURN_TYPES: Readonly<Record<string, string>> = {
+  // The shim rebuilds the epoch as a double statement-expression.
+  'clock.now': 'double',
+};

@@ -90,11 +90,20 @@ export function randomInitLines(): string[] {
     `// than calling the platform random(min, max): the modulus rejection-free form`,
     `// avoids the modulo bias a naive (rand % (max-min)) introduces. max > min`,
     `// is assumed (the HAL validates this at the source level).`,
+    `static inline double __tc_random(void) {`,
+    `    // Math.random() — [0, 1). Same entropy source as the HAL Random class.`,
+    `    return static_cast<double>(__tc_rand_next() & 0x7FFFFFFFU) / 2147483648.0;`,
+    `}`,
     `static inline int32_t __tc_rand_range(int32_t min, int32_t max) {`,
     `    if (max <= min) { return min; }`,
     `    uint32_t span = static_cast<uint32_t>(max) - static_cast<uint32_t>(min);`,
     `    uint32_t r = __tc_rand_next();`,
-    `    return static_cast<int32_t>(min + static_cast<int32_t>(r % (span + 1U)));`,
+    // Half-open [min, max-1] — the HAL contract both halves of this file
+    // document. The old `r % (span + 1U)` was INCLUSIVE of max, so
+    // `arr[Random.upTo(arr.length)]` drew index N of an N-element vector
+    // one draw in N+1 — a hardware-proven out-of-bounds read past the heap
+    // block that aborted the board (demo-sentry round 11, F1).
+    `    return static_cast<int32_t>(min + static_cast<int32_t>(r % span));`,
     `}`,
     `// CUTTLEFISH_RANDOM_END`,
     ``,

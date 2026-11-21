@@ -10,6 +10,7 @@
 
 import type { HALOpIR } from '@typecad/cuttlefish/api/shared';
 import type { ZephyrChipDescriptor } from '../chips/types.js';
+import { getActiveI2sUsage } from '../chips/index.js';
 
 /** The C variable names for an I2S controller's state. */
 function prefix(idx: number): string {
@@ -72,6 +73,14 @@ export function i2sInitLines(chip: ZephyrChipDescriptor, controllerIndex: number
       `static int16_t ${p}_txbuf[${blockBytes / 2}];`,
       `static bool ${p}_tx_started = false;`,
     );
+    // The ESP32 I2S driver (i2s_esp32.c) keeps ONE shared state for both
+    // directions — I2S_TRIGGER_START is legal only from READY and flips the
+    // state to RUNNING, so a second START on the other direction fails -EIO.
+    // A controller that both writes AND reads must start ONCE with
+    // I2S_DIR_BOTH (queue the TX block, then one atomic trigger).
+    if (usage.read || usage.readAt) {
+      lines.push(`static bool ${p}_stream_started = false;`);
+    }
   }
   if (usage.read || usage.readAt) {
     lines.push(`static int16_t ${p}_rxbuf[${blockBytes / 2}];`);
@@ -117,8 +126,33 @@ export function lowerI2s(
         const v = i < samples.length ? samples[i] : 0;
         writes.push(`${p}_txbuf[${i}] = static_cast<int16_t>(${v});`);
       }
+      // LOOPBACK / FULL-DUPLEX DISCIPLINE. The i2s_esp32 driver keeps ONE
+      // shared state for both directions: I2S_TRIGGER_START is legal only
+      // from READY and flips the state to RUNNING, so starting TX and RX
+      // separately can never work — whichever START comes second fails
+      // -EIO and its stream never runs (the 22-i2s loopback read all
+      // zeros even with the data line jumpered: the 1ms TX block was long
+      // gone and the RX START had been rejected). When the program also
+      // READS on this controller, the FIRST write queues the block and
+      // triggers ONE I2S_DIR_BOTH START — both DMAs begin together, so the
+      // first received block IS the first transmitted one. A lone-RX stream
+      // (a read() that ran first) is DROPped to READY before the BOTH START.
+      // MULTI-WRITE POLICY: the esp32 i2s driver's TX queue holds ~one block
+      // — a second write before the first has clocked out returns -EIO
+      // (bench-observed in the 22-i2s suite). Retry with a wait of one block
+      // duration (the DMA drains exactly that fast) up to four attempts; a
+      // still-failing write reports once. No stream-state surgery — a DROP
+      // would kill the shared BOTH stream.
+      const blockMs = Math.max(1, Math.ceil((blockFrames * 1000) / hz));
+      const txWrite = 'int err = -1; for (int wt = 0; wt < 4 && err != 0; wt++) { err = i2s_buf_write(' + p + '_dev, ' + p + '_txbuf, ' + blockBytes + 'U); if (err != 0) { k_msleep(' + blockMs + '); } }';
+      const u = getActiveI2sUsage()?.get(idx);
+      const alsoReads = !!u && (u.read || u.readAt);
+      const txReport = ` if (err != 0) { printk("typecad-hal i2s: write failed: %d\\\\n", err); }`;
+      const queueAndStart = alsoReads
+        ? `if (!${p}_stream_started) { if (${p}_rx_started) { (void)i2s_trigger(${p}_dev, I2S_DIR_RX, I2S_TRIGGER_DROP); ${p}_rx_started = false; } ${writes.join(' ')} ${txWrite};${txReport} if (err == 0) { int start_err = i2s_trigger(${p}_dev, I2S_DIR_BOTH, I2S_TRIGGER_START); if (start_err != 0) { printk("typecad-hal i2s: both start failed: %d\\\\n", start_err); } else { ${p}_stream_started = true; ${p}_rx_started = true; ${p}_tx_started = true; } } } else { ${writes.join(' ')} ${txWrite};${txReport} }`
+        : `${writes.join(' ')} ${txWrite};${txReport} if (err == 0 && !${p}_tx_started) { ${p}_tx_started = true; err = i2s_trigger(${p}_dev, I2S_DIR_TX, I2S_TRIGGER_START); if (err != 0) { printk("typecad-hal i2s: tx start failed: %d\\\\n", err); } }`;
       return {
-        code: `{ if (!${p}_init_done) { ${p}_init_done = true; ${p}_init(${hz}U, ${channels}U, ${bits}U, ${blockBytes}U); } ${writes.join(' ')} int err = i2s_buf_write(${p}_dev, ${p}_txbuf, ${blockBytes}U); if (err != 0) { printk("typecad-hal i2s: write failed: %d\\n", err); } else { if (!${p}_tx_started) { ${p}_tx_started = true; err = i2s_trigger(${p}_dev, I2S_DIR_TX, I2S_TRIGGER_START); if (err != 0) { printk("typecad-hal i2s: tx start failed: %d\\n", err); } } } }`,
+        code: `{ if (!${p}_init_done) { ${p}_init_done = true; ${p}_init(${hz}U, ${channels}U, ${bits}U, ${blockBytes}U); } ${queueAndStart} }`,
       };
     }
     case 'i2s.read': {

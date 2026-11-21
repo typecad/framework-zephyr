@@ -521,7 +521,12 @@ elseif (-not $NoWorkspace) {
     }
     $parent = Split-Path -Parent $env:WORKSPACE_DIR
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    Invoke-Native { & $MambaExe run -n $ENV_NAME west init -m $ZEPHYR_MANIFEST_URL --mr $ZEPHYR_MANIFEST_REV $env:WORKSPACE_DIR } "west init"
+    # -o=--depth=1 shallow-clones the manifest repo at the pinned tag (west
+    # forwards it to `git clone --branch <tag> --depth=1`). Nothing downstream
+    # reads zephyr git history (catalog / SBOM read file trees + west list), so
+    # depth 1 is safe. The MODULES stay full clones: zephyr's manifest pins
+    # them by SHA, which a --depth fetch cannot resolve on GitHub.
+    Invoke-Native { & $MambaExe run -n $ENV_NAME west init -m $ZEPHYR_MANIFEST_URL --mr $ZEPHYR_MANIFEST_REV -o=--depth=1 $env:WORKSPACE_DIR } "west init"
   }
   Write-Host "init-workspace: running west update (fetches zephyr + modules)..."
   Invoke-Native { & $MambaExe run -n $ENV_NAME west update } "west update"

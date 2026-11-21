@@ -2,109 +2,258 @@
 // @typecad/framework-zephyr — Zephyr environment doctor
 //
 // `typecad-hal doctor` (Zephyr framework) — verify west (the Zephyr build tool)
-// is installed + responsive, the Zephyr RTOS is inside the framework's declared
-// compat range, and the configured board target exists in the checkout. Exits 0
-// if the environment is OK, non-zero otherwise. Follows the same contract
-// doctor shape (dispatched via the framework's `doctor` export) and reuses
-// checkZephyrEnv so the detection logic can be shared with the build/test gates.
+// is installed + responsive, a Zephyr tree is present and inside the
+// framework's declared compat range, the toolchain bundle is there, the
+// configured board target exists, and the configured probe is valid with its
+// host tool installed. Exits 0 if the environment is OK, 1 otherwise. Rows are
+// rendered by cuttlefish's shared doctor report (text or --json).
 // ---------------------------------------------------------------------------
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import * as ui from '@typecad/cuttlefish/utils/ui';
 import { loadTypecadConfig } from '@typecad/cuttlefish/config-loader';
 import { checkZephyrEnv } from './toolchain/env-check.js';
-import { PINNED_ZEPHYR_MANIFEST_REV, PINNED_ZEPHYR_SDK_VERSION, sdkFingerprint } from '@typecad/cuttlefish/board-catalog';
+import { checkZephyrSdk, PINNED_ZEPHYR_MANIFEST_REV, ZEPHYR_INSTALL_CMD } from '@typecad/cuttlefish/board-catalog';
 import { resolveChipFromBoard } from './chips/resolve.js';
+import { discoverWest, type WestInstall } from './toolchain/west-discover.js';
+import { buildEnv } from './toolchain/west-spawn.js';
+import { resolveSessionOpenOcd } from './toolchain/index.js';
+
+type ProbeMethod = { id: string; runner?: string; debug?: boolean };
 
 /**
- * Verify west is installed + responsive, the Zephyr RTOS is inside the supported
- * range, and the configured board target exists in the checkout. Sets
- * process.exitCode = 1 on failure. Thin presenter over checkZephyrEnv.
+ * Host executables each west flash runner needs. Data, keyed by runner (the
+ * one axis toolchain decisions may branch on). Runners absent here are not
+ * checked; `null` marks runners that need no separate host tool.
  */
-export function runDoctor(): void {
-  ui.printHeader();
-  ui.printStep('Checking Zephyr environment...');
+const RUNNER_TOOLS: Record<string, { exe: readonly string[]; winDirs?: readonly string[]; note?: string } | null> = {
+  'dfu-util': { exe: ['dfu-util'] },
+  jlink: {
+    exe: process.platform === 'win32' ? ['JLink'] : ['JLinkExe'],
+    winDirs: ['C:\\Program Files\\SEGGER\\JLink', 'C:\\Program Files (x86)\\SEGGER\\JLink'],
+  },
+  stm32cubeprogrammer: {
+    exe: ['STM32_Programmer_CLI'],
+    winDirs: ['C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin'],
+  },
+  nrfjprog: { exe: ['nrfjprog'] },
+  nrfutil: { exe: ['nrfutil'] },
+  pyocd: { exe: ['pyocd'] },
+  bossac: { exe: ['bossac'] },
+  stm32flash: { exe: ['stm32flash'] },
+  linkserver: { exe: ['LinkServer'] },
+  'probe-rs': { exe: ['probe-rs'] },
+  blackmagicprobe: null, // drives the toolchain's gdb
+  esp32: null, // esptool ships in west's Python environment
+  uf2: null, // copies to the board's USB drive
+};
 
+/** The PATH west's own child processes see, plus a micromamba env's bin dirs. */
+function westSearchDirs(install: WestInstall | null): string[] {
+  const env = install ? buildEnv(install) : process.env;
+  const pathValue = env.PATH ?? env.Path ?? '';
+  const dirs = pathValue.split(delimiter).filter(Boolean);
+  if (install?.mode === 'micromamba' && install.mambaRootPrefix) {
+    const envDir = join(install.mambaRootPrefix, 'envs', install.envName ?? 'zephyr');
+    dirs.push(...(process.platform === 'win32'
+      ? [envDir, join(envDir, 'Library', 'bin'), join(envDir, 'Scripts')]
+      : [join(envDir, 'bin')]));
+  }
+  return dirs;
+}
+
+function findExecutable(names: readonly string[], dirs: readonly string[]): string | undefined {
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
+  for (const dir of dirs) {
+    for (const name of names) {
+      for (const ext of exts) {
+        const candidate = join(dir, name + ext);
+        if (existsSync(candidate)) return candidate;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Probe methods from the persisted board constants of a previous build. */
+function probeMethodsFromBuild(projectDir: string, entry: string | undefined, outDir: string | undefined): ProbeMethod[] {
+  const appDir = entry ? resolve(projectDir, dirname(entry), outDir ?? '.') : undefined;
+  const candidates = [
+    ...(appDir ? [join(appDir, 'src', 'board-constants.json'), join(appDir, 'board-constants.json')] : []),
+    join(projectDir, 'out', 'src', 'board-constants.json'),
+    join(projectDir, 'src', 'out', 'src', 'board-constants.json'),
+  ];
+  const file = candidates.find((p) => existsSync(p));
+  if (!file) return [];
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, string | number | boolean>;
+    return [...(resolveChipFromBoard(new Map(Object.entries(raw)))?.probeMethods ?? [])] as ProbeMethod[];
+  } catch {
+    return [];
+  }
+}
+
+export function runDoctor(options: { json?: boolean } = {}): void {
   const config = loadTypecadConfig(process.cwd());
+  const projectDir = config ? dirname(config.configPath) : process.cwd();
   const buildTarget = config?.buildTarget;
 
   const result = checkZephyrEnv(buildTarget);
   const c = result.check;
+  const rows: ui.DoctorRow[] = [];
+  const fixes: ui.DoctorFix[] = [];
+  const failMessage = result.ok ? undefined : result.messages.join(' ');
+  const failFix = (): void => {
+    if (!result.ok) fixes.push({ text: failMessage!, ...(result.fixCommand ? { command: result.fixCommand } : {}) });
+  };
 
-  // west (the Zephyr build tool) presence.
+  // west
   if (c.westFound) {
-    const ver = c.westVersion ?? 'found';
-    const src = c.westSource ? `  (${c.westSource})` : '';
-    ui.printInfo(`west ............. ${ver}  ✓${src}`);
+    rows.push({ label: 'west', value: `${c.westVersion ?? 'found'}${c.westSource ? `  (${c.westSource})` : ''}`, status: 'ok' });
   } else {
-    ui.printError('west ............. NOT FOUND');
+    rows.push({ label: 'west', value: 'not found', status: 'fail' });
+    failFix();
   }
 
-  // Zephyr RTOS version + declared compat range.
-  ui.printInfo(`ZEPHYR_BASE ...... ${c.zephyrBase ?? '(not set)'}`);
-  ui.printInfo(`Zephyr version .. ${c.zephyrVersion ?? 'unknown (could not read ZEPHYR_BASE/VERSION)'}`);
-  ui.printInfo(`Workspace pin ... ${PINNED_ZEPHYR_MANIFEST_REV} (SDK ${PINNED_ZEPHYR_SDK_VERSION})`);
-  const fp = c.zephyrBase ? sdkFingerprint(c.zephyrBase) : undefined;
-  ui.printInfo(`SDK fingerprint . ${fp ?? '(no tree — run ' + 'npx --package @typecad/framework-zephyr zephyr-installer)'}`);
-  ui.printInfo(`Supported range . ${c.compatRange ?? '(none declared)'}`);
-
-  if (c.compatStatus === 'out-of-range') {
-    ui.printError(`Zephyr ${c.zephyrVersion} is OUTSIDE the supported range (${c.compatRange}).`);
-  } else if (c.compatStatus === 'undetectable') {
-    ui.printWarning('Could not detect the Zephyr version (is ZEPHYR_BASE set?) — compat check skipped.');
+  // Zephyr tree + version
+  const pinned = PINNED_ZEPHYR_MANIFEST_REV.replace(/^v/, '');
+  if (c.compatStatus === 'undetectable') {
+    rows.push({
+      label: 'Zephyr',
+      value: c.zephyrBase ? `not a Zephyr tree: ${c.zephyrBase}` : 'not found',
+      status: 'fail',
+    });
+    if (c.westFound) failFix();
+  } else if (c.compatStatus === 'out-of-range') {
+    rows.push({ label: 'Zephyr', value: `${c.zephyrVersion} @ ${c.zephyrBase}`, status: 'fail', detail: [`supported: ${c.compatRange}`] });
+    if (c.westFound) failFix();
   } else {
-    ui.printInfo('Zephyr compat ... OK');
+    const differs = c.zephyrVersion !== pinned;
+    rows.push({
+      label: 'Zephyr',
+      value: `${c.zephyrVersion} @ ${c.zephyrBase}`,
+      status: differs ? 'warn' : 'ok',
+      ...(differs ? { detail: [`this release is validated against ${pinned} (supported: ${c.compatRange})`] } : {}),
+    });
+    if (differs) fixes.push({ text: `To use the validated Zephyr ${pinned}, re-pin your tree:`, command: ZEPHYR_INSTALL_CMD });
   }
 
-  // Board target availability.
-  if (buildTarget) {
-    const resolved = c.resolvedBoardTarget ?? buildTarget;
-    const arrow = resolved === buildTarget ? '' : ` → ${resolved}`;
+  // Toolchain bundle (compilers) — only meaningful with a tree.
+  if (c.zephyrBase && c.compatStatus !== 'undetectable') {
+    const sdk = checkZephyrSdk(c.zephyrBase);
+    if ((sdk.status === 'ok' || sdk.status === 'version-mismatch') && sdk.toolchainDir) {
+      rows.push({ label: 'Toolchain', value: `SDK ${sdk.toolchainVersion ?? ''} @ ${sdk.toolchainDir}`, status: 'ok' });
+    } else if (sdk.status === 'toolchain-mismatch') {
+      rows.push({
+        label: 'Toolchain',
+        value: `SDK ${sdk.toolchainVersion} @ ${sdk.toolchainDir}`,
+        status: 'fail',
+        detail: [`expected SDK ${sdk.pinnedToolchainVersion} to match Zephyr ${pinned}`],
+      });
+      fixes.push({ text: 'Re-fetch the matching toolchain:', command: ZEPHYR_INSTALL_CMD });
+    } else {
+      rows.push({
+        label: 'Toolchain',
+        value: 'not found',
+        status: 'warn',
+        detail: ['west builds may still find one, but some flash/debug runners will not'],
+      });
+      fixes.push({ text: 'Install the Zephyr SDK toolchain:', command: ZEPHYR_INSTALL_CMD });
+    }
+  }
+
+  // Board target
+  if (!config) {
+    rows.push({ label: 'Board', value: 'no project here', status: 'info' });
+  } else if (!buildTarget) {
+    rows.push({ label: 'Board', value: 'none set in typecad-hal.config.ts', status: 'info' });
+  } else {
+    const resolvedTarget = c.resolvedBoardTarget ?? buildTarget;
+    const shown = resolvedTarget === buildTarget ? buildTarget : `${buildTarget} → ${resolvedTarget}`;
     if (c.boardTargetSupported === false) {
-      ui.printError(`Board target .... ${buildTarget}${arrow}  NOT found in this Zephyr checkout`);
-      ui.printInfo('  → check the board id, or run: west boards');
+      rows.push({
+        label: 'Board',
+        value: `${shown}  not found`,
+        status: 'fail',
+        ...(c.boardSuggestion ? { detail: [`did you mean ${c.boardSuggestion}?`] } : {}),
+      });
+      failFix();
     } else if (c.boardTargetSupported === undefined) {
-      ui.printInfo(`Board target .... ${buildTarget}${arrow}`);
-      ui.printInfo('(could not verify board presence — no ZEPHYR_BASE boards/ tree found)');
+      rows.push({ label: 'Board', value: shown, status: 'info', detail: ['not checked (no Zephyr tree to look in)'] });
     } else {
-      ui.printInfo(`Board target .... ${buildTarget}${arrow}`);
+      rows.push({ label: 'Board', value: shown, status: 'ok' });
     }
-  } else {
-    ui.printInfo('(no buildTarget in typecad-hal.config.ts — skipping board check)');
   }
 
-  // Probe methods — from the board package's table, via the board constants
-  // the transpile persists (candidates cover the standard out-dir layouts).
-  // The debug line lists the debug-capable subset (bootloaders can't debug).
-  if (buildTarget) {
-    const bcPath = [
-      join(process.cwd(), 'out', 'src', 'board-constants.json'),
-      join(process.cwd(), 'out', 'board-constants.json'),
-      join(process.cwd(), 'src', 'out', 'src', 'board-constants.json'),
-      join(process.cwd(), 'src', 'out', 'board-constants.json'),
-    ].find((p) => existsSync(p));
-    if (bcPath) {
-      try {
-        const raw = JSON.parse(readFileSync(bcPath, 'utf8')) as Record<string, string | number | boolean>;
-        const chip = resolveChipFromBoard(new Map(Object.entries(raw)));
-        const methods = chip?.probeMethods ?? [];
-        if (methods.length > 0) {
-          ui.printInfo(`Probe methods .... ${methods.map((m) => m.id).join(', ')}  (zephyr.probe / --probe)`);
-          const debuggable = methods.filter((m) => m.debug !== false).map((m) => m.id);
-          ui.printInfo(`Debug methods .... ${debuggable.join(', ') || '(none — an external probe is required)'}`);
+  // Probe — the configured method (zephyr.probe), checked against the board's
+  // table (catalog first, else a previous build's board constants), plus the
+  // host tool its runner needs.
+  if (config && buildTarget && c.boardTargetSupported !== true) {
+    // The probe table belongs to the board — without a confirmed board there
+    // is nothing to check it against, so say why instead of guessing.
+    const configured = typeof config.zephyrConfig?.probe === 'string' ? config.zephyrConfig.probe : undefined;
+    if (configured) {
+      rows.push({
+        label: 'Probe',
+        value: configured,
+        status: 'info',
+        detail: [c.boardTargetSupported === false ? 'not checked until the board is fixed' : 'not checked (the board couldn\'t be verified)'],
+      });
+    }
+  } else if (config && buildTarget) {
+    const methods: ProbeMethod[] = c.boardEntry?.probeMethods?.length
+      ? [...c.boardEntry.probeMethods]
+      : probeMethodsFromBuild(projectDir, config.entry, config.outputOutDir);
+    const configured = typeof config.zephyrConfig?.probe === 'string' ? config.zephyrConfig.probe : undefined;
+    const method = configured ? methods.find((m) => m.id === configured) : undefined;
+
+    if (!configured) {
+      rows.push({ label: 'Probe', value: 'board default (no zephyr.probe set)', status: 'info' });
+    } else if (methods.length > 0 && !method) {
+      rows.push({ label: 'Probe', value: `${configured}  not a method this board supports`, status: 'fail' });
+      fixes.push({ text: `Set zephyr.probe in typecad-hal.config.ts to one of: ${methods.map((m) => m.id).join(', ')}.` });
+    } else {
+      rows.push({
+        label: 'Probe',
+        value: `${configured}${method?.runner ? `  (runner: ${method.runner})` : ''}`,
+        status: methods.length > 0 ? 'ok' : 'info',
+        ...(methods.length === 0 ? { detail: ['not checked (this board lists no probe methods)'] } : {}),
+      });
+    }
+
+    const runner = method?.runner;
+    if (runner) {
+      if (runner === 'openocd') {
+        const install = discoverWest();
+        const ocd = resolveSessionOpenOcd(process.env, install?.sdkInstallDir);
+        if (ocd) rows.push({ label: 'openocd', value: ocd.exe, status: 'ok' });
+        else {
+          rows.push({ label: 'openocd', value: 'not found', status: 'warn', detail: ['uploads with this probe will fail'] });
+          fixes.push({ text: 'Install openocd (the Zephyr installer provides it), or set OPENOCD to its path.', command: ZEPHYR_INSTALL_CMD });
         }
-      } catch { /* best-effort listing */ }
-    } else {
-      ui.printInfo('Probe methods .... (build once to list them)');
+      } else if (RUNNER_TOOLS[runner]) {
+        const spec = RUNNER_TOOLS[runner]!;
+        const dirs = [...westSearchDirs(discoverWest()), ...(process.platform === 'win32' ? spec.winDirs ?? [] : [])];
+        const found = findExecutable(spec.exe, dirs);
+        if (found) rows.push({ label: spec.exe[0]!, value: found, status: 'ok' });
+        else {
+          rows.push({ label: spec.exe[0]!, value: 'not found', status: 'warn', detail: ['uploads with this probe will fail'] });
+          fixes.push({ text: `Install ${spec.exe[0]} (needed by the '${runner}' runner) and put it on PATH.` });
+        }
+      }
+    }
+
+    if (methods.length > 0) {
+      const debuggable = methods.filter((m) => m.debug !== false).map((m) => m.id);
+      rows.push({
+        label: 'Probe methods',
+        value: methods.map((m) => m.id).join(', '),
+        status: 'info',
+        detail: [`can debug: ${debuggable.join(', ') || 'none (an external probe is required)'}`],
+      });
     }
   }
 
-  // Exit code — 0 ok, non-zero otherwise.
-  if (result.ok) {
-    ui.printSuccess('Environment OK');
-    return; // exitCode stays unset => 0
-  }
-  for (const line of result.messages) ui.printInfo(line);
-  process.exitCode = 1;
+  ui.printDoctorReport({ title: 'Checking Zephyr environment...', rows, fixes }, options);
 }

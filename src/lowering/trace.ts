@@ -105,6 +105,8 @@ export function uiFrameTraceLines(frameAlarmMs?: number): string[] {
     : [];
   return [
     '// CUTTLEFISH_TRACE_UI_BEGIN',
+    '#ifndef CUTTLEFISH_TRACE_UI_SINGLETON_DEFS',
+    '#define CUTTLEFISH_TRACE_UI_SINGLETON_DEFS',
     '#if defined(CUTTLEFISH_TRACE_UI)',
     ...alarmDefine,
     'static uint32_t __tc_trace_ui_frames = 0U;',
@@ -160,6 +162,7 @@ export function uiFrameTraceLines(frameAlarmMs?: number): string[] {
     '    for (uint8_t i = 0U; i < 5U; i++) { __tc_trace_ui_phase[i] = 0ULL; }',
     '#endif',
     '}',
+    '#endif // CUTTLEFISH_TRACE_UI_SINGLETON_DEFS',
     '// CUTTLEFISH_TRACE_UI_END',
   ];
 }
@@ -188,7 +191,10 @@ export function traceHeartbeatLines(intervalMs: number, withUi: boolean, alarms?
     : [];
   return [
     '// CUTTLEFISH_TRACE_BEGIN',
+    '#include <zephyr/kernel_structs.h>',
     '#if defined(CUTTLEFISH_ENTRY_TU) && defined(CONFIG_THREAD_MONITOR) && defined(CONFIG_THREAD_RUNTIME_STATS)',
+    '#ifndef CUTTLEFISH_TRACE_SINGLETON_DEFS',
+    '#define CUTTLEFISH_TRACE_SINGLETON_DEFS',
     `#define __TC_TRACE_HB_MS ${ms}U`,
     ...stackAlarmDefine,
     'static uint32_t __tc_trace_seq = 0U;',
@@ -196,8 +202,16 @@ export function traceHeartbeatLines(intervalMs: number, withUi: boolean, alarms?
     // Stack fields print -1 when the platform cannot inspect that thread
     // (ARC-style NO_UNUSED_STACK_INSPECTION faults) — the host reads the
     // sentinel as "unknown", not zero.
+    'static uint32_t __tc_trace_visits = 0U;',
     'static void __tc_trace_thread_line(const struct k_thread* cthread, void* user_data) {',
     '    (void)user_data;',
+    '    // Print budget: a corrupted monitor list (a dead-but-linked node can',
+    '    // self-loop — observed on hardware after the MQTT poll thread exited',
+    '    // under trace) must not flood the console at line rate. The budget',
+    '    // bounds the printing; the walk itself is the kernel'+"'"+'s locked',
+    '    // iterator.',
+    '    if (__tc_trace_visits >= 64U) { return; }',
+    '    __tc_trace_visits += 1U;',
     '    // The foreach callback hands out a const thread; the stats/name',
     '    // syscalls take k_tid_t (non-const) — the same const_cast Zephyr\'s',
     '    // own thread_analyzer performs at this exact boundary.',
@@ -255,6 +269,15 @@ export function traceHeartbeatLines(intervalMs: number, withUi: boolean, alarms?
         '    __tc_trace_ui_reset();',
       ]
       : []),
+    // Bounded thread walk (round-7 finding, demo-uplink): k_thread_foreach
+    // has no cycle guard, and a dynamically created thread that exits (the
+    // MQTT shim's poll thread after a broker disconnect) left the monitor
+    // list self-looped on hardware — the heartbeat then printed one
+    // [TR:TH: line forever at line rate and hung the system work queue.
+    // Walk the list manually with a hard step cap so a corrupted/dead node
+    // degrades THIS heartbeat instead of wedging the sampler. 64 steps is
+    // ~4x the thread count of the busiest traced program on this tree.
+    '    __tc_trace_visits = 0U;',
     '    k_thread_foreach(__tc_trace_thread_line, nullptr);',
     '    k_work_reschedule(&__tc_trace_hb_dwork, K_MSEC(__TC_TRACE_HB_MS));',
     '}',
@@ -264,6 +287,7 @@ export function traceHeartbeatLines(intervalMs: number, withUi: boolean, alarms?
     '    return 0;',
     '}',
     'SYS_INIT(__tc_trace_hb_boot, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);',
+    '#endif // CUTTLEFISH_TRACE_SINGLETON_DEFS',
     '#endif // CUTTLEFISH_ENTRY_TU && THREAD_MONITOR && THREAD_RUNTIME_STATS',
     '// CUTTLEFISH_TRACE_END',
   ];

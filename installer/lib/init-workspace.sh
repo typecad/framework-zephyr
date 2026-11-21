@@ -10,9 +10,17 @@
 #   MAMBA_ROOT_PREFIX                         (resolved by install.sh)
 #   DRY_RUN                                   (install.sh flag)
 #
-# Uses `west init -m <url> --mr <rev> <dir>` to pin the manifest to a specific
-# Zephyr tag, then `west update` to fetch zephyr + all manifest projects. The
-# resulting <WORKSPACE_DIR>/zephyr/ is what ZEPHYR_BASE points at.
+# Uses `west init -m <url> --mr <rev> -o=--depth=1 <dir>` to pin the manifest
+# to a specific Zephyr tag and SHALLOW-clone the manifest repo at that tag
+# (west forwards the clone option to `git clone --branch <tag> --depth=1` —
+# only the tag tip comes down, not the full zephyr history). Nothing
+# downstream reads zephyr git history: the board catalog / SBOM / licenses
+# read file trees and `west list` output, so a shallow manifest repo is safe.
+# The MODULES are deliberately not depth-limited: zephyr's manifest pins them
+# by SHA, and GitHub cannot serve a --depth fetch that resolves a SHA (west
+# fetches all branch refs, then rev-parses the SHA — fails under --depth).
+# Then `west update` fetches zephyr's manifest projects. The resulting
+# <WORKSPACE_DIR>/zephyr/ is what ZEPHYR_BASE points at.
 #
 # Idempotent: if <WORKSPACE_DIR>/.west already exists, skips init and only
 # updates. micromamba run -n runs west in the env without sourcing activation
@@ -24,7 +32,7 @@ init_workspace() {
   echo "init-workspace:   manifest: $ZEPHYR_MANIFEST_URL @ $ZEPHYR_MANIFEST_REV"
 
   if [ "$DRY_RUN" = "1" ]; then
-    echo "init-workspace: [DRY-RUN] would run: $MAMBA run -n $ENV_NAME west init -m $ZEPHYR_MANIFEST_URL --mr $ZEPHYR_MANIFEST_REV $WORKSPACE_DIR"
+    echo "init-workspace: [DRY-RUN] would run: $MAMBA run -n $ENV_NAME west init -m $ZEPHYR_MANIFEST_URL --mr $ZEPHYR_MANIFEST_REV -o=--depth=1 $WORKSPACE_DIR"
     echo "init-workspace: [DRY-RUN] would run: $MAMBA run -n $ENV_NAME west update"
     echo "init-workspace: [DRY-RUN] would set ZEPHYR_BASE=$WORKSPACE_DIR/zephyr"
     return 0
@@ -60,11 +68,13 @@ init_workspace() {
       rm -rf "$WORKSPACE_DIR/.west"
     fi
     mkdir -p "$(dirname "$WORKSPACE_DIR")"
-    "$MAMBA" run -n "$ENV_NAME" west init -m "$ZEPHYR_MANIFEST_URL" --mr "$ZEPHYR_MANIFEST_REV" "$WORKSPACE_DIR" \
+    "$MAMBA" run -n "$ENV_NAME" west init -m "$ZEPHYR_MANIFEST_URL" --mr "$ZEPHYR_MANIFEST_REV" -o=--depth=1 "$WORKSPACE_DIR" \
       || { echo "init-workspace: west init failed" >&2; return 1; }
   fi
 
-  # west update pulls zephyr + all modules. Slow the first time (large clone).
+  # west update pulls all modules. Slow the first time (large clones) — the
+  # zephyr manifest repo above is already shallow, but module revisions are
+  # SHAs and cannot be fetched with a depth limit (see header comment).
   echo "init-workspace: running west update (this fetches zephyr + modules)..."
   "$MAMBA" run -n "$ENV_NAME" west update \
     || { echo "init-workspace: west update failed" >&2; return 1; }

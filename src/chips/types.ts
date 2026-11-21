@@ -59,6 +59,10 @@ export interface ZephyrGpioController {
 export interface ZephyrBusController {
   /** Devicetree nodelabel, e.g. 'i2c1', 'spi2', 'uart0'. */
   readonly nodeLabel: string;
+  /** The controller's binding identity (the node's `compatible`), e.g.
+   *  'espressif,esp32-spi' / 'st,stm32-spi' — data for binding-specific
+   *  overlay properties. Absent when the harvest saw no compatible. */
+  readonly compatible?: string;
   /**
    * Counter child form only: the labeled TIMER PARENT's nodelabel (ESP32
    * timer0-3). The counter device is an unlabeled `counter {}` child; the
@@ -75,7 +79,9 @@ export interface ZephyrBusController {
    * the group is pure data: which pads carry the signals.
    */
   readonly pinctrl?: {
-    /** Pinmux header to #include (token definitions). */
+    /** Pinmux header to #include (token definitions). May be a comma-joined
+     *  chain — the overlay splits it into one #include per header (the
+     *  ESP32 remux trio). */
     readonly include: string;
     /** Output-signal pinmux tokens (emitted as group1). */
     readonly pinmux: readonly string[];
@@ -96,6 +102,12 @@ export interface ZephyrBusController {
    * `pinctrl-0 = <&<group>>` when enabling the controller.
    */
   readonly pinctrlRef?: string;
+  /**
+   * Distinct label for a SYNTHESIZED pinctrl group when the board's own
+   * `<nodeLabel>_default` already exists (config bus remux — redefining
+   * the board's label is a DT error).
+   */
+  readonly pinctrlGroupName?: string;
   /**
    * Raw devicetree property lines emitted inside the enable block — for
    * bindings with required properties the board DTS only sets on its own
@@ -244,12 +256,29 @@ export interface ZephyrChipDescriptor {
   /** The SoC's RTC wake timer (ESP32 family rtc_timer fact) — Power.offFor
    *  arms it (esp_sleep_enable_timer_wakeup) before soft-off. */
   readonly powerWakeTimer?: boolean;
+  /** Bus pin REMUX: any pad can carry any peripheral signal (the ESP32
+   *  family's GPIO matrix). The one fact `zephyr.buses` config entries
+   *  (synthesized pinctrl groups) need — consumers read this, never the
+   *  soc name. Derived from the soc-segment table in resolve.ts (DATA,
+   *  like every family convention). */
+  readonly busPinRemux?: boolean;
   /** CAN controllers (harvested labeled can@ nodes) — the lowering
    *  addresses the first by its DT nodelabel. */
   readonly can?: { controllers: readonly { nodeLabel: string; compatible: string; txPad?: number; rxPad?: number }[] };
   /** I2S controllers (harvested labeled i2s@ nodes) — the lowering
-   *  addresses each by its DT nodelabel. */
-  readonly i2s?: { controllers: readonly { nodeLabel: string; compatible: string }[] };
+   *  addresses each by its DT nodelabel. dmaLabel/pads carry the
+   *  STM32-style facts: the node's own DMA controller (its dtsi `dmas`
+   *  phandle) and the AF-table pinctrl groups per wire function — the
+   *  overlay enables one, synthesizes the other. ESP32 nodes carry
+   *  neither (the family's overlay shape owns the GDMA + clock loop). */
+  readonly i2s?: {
+    controllers: readonly {
+      nodeLabel: string;
+      compatible: string;
+      dmaLabel?: string;
+      pads?: { ck?: string; sd?: string; ws?: string };
+    }[];
+  };
   /** Zephyr board target (the `west build -b <id>` argument), e.g. 'xiao_ble'. */
   readonly id: string;
   /** SoC family, e.g. 'nrf52840'. */
@@ -444,9 +473,20 @@ export interface ZephyrChipDescriptor {
   /**
    * WiFi capability marker. Present only on chips with a WiFi radio (ESP32-S3).
    * Read by profileDiagnostics to flag wifi.* usage on chips without a radio.
-   * Omit on radioless chips (nRF52840) — its absence is the "no WiFi" signal.
+   * Three-state from the harvest: true when the SoC's dtsi declares the
+   * radio node, FALSE when a fresh harvest found none (radioless — the
+   * "no WiFi" diagnostic keys on this), undefined when no catalog backed
+   * the chip (probe flows) — absence of data is not a verdict.
    */
-  readonly wifi?: { readonly supported: true };
+  readonly wifi?: { readonly supported: boolean };
+  /** The soc node's own compatible from the harvest (`st,stm32f411`) —
+   *  DATA for series-keyed shim tables. Absent on chips without a
+   *  catalog-backed harvest. */
+  readonly socCompatible?: string;
+  /** SRAM size in KB from the harvest (the zephyr,sram chosen node) —
+   *  DATA for the Kconfig stack-floor clamp (small-RAM boards link
+   *  proportionally clamped floors instead of overflowing their region). */
+  readonly ramKb?: number;
   /**
    * Probe methods the board supports, in user-facing terms. Each entry maps a
    * friendly id (`stlink`, `dfu`, `jlink`, …) to the west runner it drives

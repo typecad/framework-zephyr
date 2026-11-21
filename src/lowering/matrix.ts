@@ -16,11 +16,23 @@ import type { HALOpIR } from '@typecad/cuttlefish/api/shared';
  * Emit the matrix trampoline state. Called from shimLines when the program
  * uses matrix.* — the listener targets the synthesized tc_matrix node, the
  * handler pointer is assigned by the on_key lowering.
+ *
+ * SINGLETON block: INPUT_CALLBACK_DEFINE registers into the input subsystem's
+ * iterable section, so a per-TU copy would register once per translation
+ * unit — a multi-file program would fire the callback once per TU per key
+ * event, and an op landing in a non-entry TU would assign a handler pointer
+ * the registered (entry-TU) callback never reads. The entry TU carries the
+ * definitions; every other TU gets an extern of the handler pointer. The
+ * two guards keep any header/.cpp splice order within one TU safe (see
+ * preferences.ts for the full case analysis).
  */
 export function matrixInitLines(): string[] {
   return [
     '// CUTTLEFISH_MATRIX_BEGIN',
-    'static void (*__tc_matrix_on_key)(double, double, bool) = NULL;',
+    '#if defined(CUTTLEFISH_ENTRY_TU)',
+    '#ifndef CUTTLEFISH_MATRIX_SINGLETON_DEFS',
+    '#define CUTTLEFISH_MATRIX_SINGLETON_DEFS',
+    'void (*__tc_matrix_on_key)(double, double, bool) = NULL;',
     'static int32_t __tc_matrix_row = -1;',
     'static int32_t __tc_matrix_col = -1;',
     'static void __tc_matrix_cb(struct input_event* evt, void* user_data) {',
@@ -42,6 +54,13 @@ export function matrixInitLines(): string[] {
     '    }',
     '}',
     'INPUT_CALLBACK_DEFINE(DEVICE_DT_GET(DT_NODELABEL(tc_matrix)), __tc_matrix_cb, NULL);',
+    '#endif // CUTTLEFISH_MATRIX_SINGLETON_DEFS',
+    '#else // !CUTTLEFISH_ENTRY_TU',
+    '#ifndef CUTTLEFISH_MATRIX_SINGLETON_DECLS',
+    '#define CUTTLEFISH_MATRIX_SINGLETON_DECLS',
+    'extern void (*__tc_matrix_on_key)(double, double, bool);',
+    '#endif // CUTTLEFISH_MATRIX_SINGLETON_DECLS',
+    '#endif // CUTTLEFISH_ENTRY_TU',
     '// CUTTLEFISH_MATRIX_END',
   ];
 }

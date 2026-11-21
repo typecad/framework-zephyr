@@ -7,9 +7,11 @@
 // `adc_read`. The channel index comes from the chip descriptor's pin→channel
 // map (XIAO D0–D3 = AIN0–AIN3).
 //
-// Channel setup is emitted in adcInitLines() (one per channel used); the ops
-// then just read. A static `adc_channel_cfg` + a per-channel "configured" flag
-// guards the setup, so repeated reads don't reconfigure.
+// Channel setup is NOT emitted here — each adc.read/adc.read_mv op inlines
+// its own first-call guard built from the INSTANCE's gain/reference opts (the
+// construction facts are authoritative over descriptor defaults). This block
+// emits what the ops consume: per-controller device handles and the
+// vref/resolution defines.
 // ---------------------------------------------------------------------------
 
 import type { HALOpIR } from '@typecad/cuttlefish/api/shared';
@@ -107,8 +109,6 @@ export function adcInitLines(
   // driver requires exactly ADC_GAIN_1 + ADC_REF_INTERNAL (Zephyr maps
   // "internal" to the VREF+ pad) with vref-mv = VDDA. The descriptor carries
   // the SoC's pair so the emitted channel setup validates in the driver.
-  const gain = chip.adc?.gain ?? 'ADC_GAIN_1_4';
-  const reference = chip.adc?.reference ?? 'ADC_REF_INTERNAL';
   const owns = (c: { controller?: string }, label: string) => (c.controller ?? primary) === label;
   const channels = (chip.adc?.channels ?? []).filter(
     (c) =>
@@ -121,39 +121,32 @@ export function adcInitLines(
       [...usedPins].some((n) => adcChannelForPin(chip, n) === c.channel && owns(c, adcControllerForPin(chip, n))),
   );
   const lines: string[] = ['// CUTTLEFISH_ADC_BEGIN'];
-  lines.push(`static const struct device* __tc_adc_dev = DEVICE_DT_GET(DT_NODELABEL(${primary}));`);
+  // Device handles are emitted for the controllers the FILTERED channels
+  // actually use. Emitting the primary handle unconditionally references a
+  // DT nodelabel the overlay never enabled when every used route sits on
+  // another controller (ESP32: primary adc0, all harvested DevKitC routes
+  // on adc1) — DEVICE_DT_GET on a disabled node is an undeclared-device
+  // compile error. No channels at all (probe paths, override-only programs)
+  // keeps the historical primary handle.
+  const neededControllers = new Set<string>(channels.map((c) => c.controller ?? primary));
+  // Inline-override devices (escape hatch): handles for the DT labels the
+  // construction opts name — they may not appear in the manifest at all.
+  for (const label of (overrideDevices ?? [])) neededControllers.add(label);
+  if (neededControllers.size === 0) neededControllers.add(primary);
+  if (neededControllers.has(primary)) {
+    lines.push(`static const struct device* __tc_adc_dev = DEVICE_DT_GET(DT_NODELABEL(${primary}));`);
+  }
   // Additional controllers referenced by used channels get their own device
   // handle (sorted for deterministic output). Channel indices collide across
   // controllers, so non-primary setup symbols carry the controller label.
-  const extraControllers = [...new Set(channels.map((c) => c.controller).filter((x): x is string => !!x && x !== primary))].sort();
-  // Inline-override devices (escape hatch): handles for the DT labels the
-  // construction opts name — they may not appear in the manifest at all.
-  for (const label of (overrideDevices ?? [])) {
-    if (label !== primary && !extraControllers.includes(label)) extraControllers.push(label);
-  }
+  const extraControllers = [...neededControllers].filter((label) => label !== primary).sort();
   for (const label of extraControllers) {
     lines.push(`static const struct device* __tc_adc_${label}_dev = DEVICE_DT_GET(DT_NODELABEL(${label}));`);
   }
-  for (const c of channels) {
-    const n = c.channel;
-    const dev = adcDevSymbol(c.controller ?? primary, primary);
-    const sym = c.controller && c.controller !== primary ? `__tc_adc_${c.controller}_${n}` : `__tc_adc${n}`;
-    lines.push(
-      `static bool ${sym}_ready = false;`,
-      `static void ${sym}_setup(void) {`,
-      `    if (${sym}_ready) return;`,
-      `    const struct adc_channel_cfg cfg = {`,
-      `        .gain = ${gain},`,
-      `        .reference = ${reference},`,
-      `        .acquisition_time = ADC_ACQ_TIME_DEFAULT,`,
-      `        .channel_id = ${n},`,
-      `        .differential = 0,`,
-      `    };`,
-      `    adc_channel_setup(${dev}, &cfg);`,
-      `    ${sym}_ready = true;`,
-      `}`,
-    );
-  }
+  // (Per-channel __tc_adc<N>_setup() functions used to be emitted here with
+  // per-use gating — the op lowering's inline guard superseded them, leaving
+  // dead definitions that tripped -Wunused-function on every ADC program.
+  // Two parallel setup mechanisms drift; the op guard is the one mechanism.)
   lines.push(`#define __TC_ADC_VREF_MV ${vref}`);
   lines.push(`#define __TC_ADC_RESOLUTION ${res}`);
   lines.push('// CUTTLEFISH_ADC_END');

@@ -113,6 +113,22 @@ export function lowerCan(
       };
     }
     case 'can.send': {
+      // A COMPUTED payload (`bus.send(id, encodeFrame(x))`) carries no
+      // static bytes: copy from the runtime vector at send time, bounded by
+      // its size and the 8-byte classic-frame limit (demo-blackbox round 4:
+      // the old path emitted dlc=0 with no copy — frames carried NO data,
+      // and zero payloads are CRC-valid, so loopback reads returned zeros
+      // that looked like a receiving bug).
+      const rt = (o as { runtimeData?: string }).runtimeData;
+      // Bind the payload expression ONCE — it may carry side effects
+      // (encodeFrame(machine.sample()) samples the model); the naive emit
+      // evaluated it per .size()/per element.
+      if (rt) {
+        const escapedNl = String.fromCharCode(92) + "n";
+        return {
+          code: `{ struct can_frame __tc_frame = { 0 }; __tc_frame.id = static_cast<uint32_t>(${o.id}); __tc_frame.flags = ${o.extended ? 'CAN_FRAME_IDE' : '0U'}; const std::vector<double> __tc_payload = ${rt}; const size_t __tc_n = __tc_payload.size() > 8U ? 8U : __tc_payload.size(); for (size_t __tc_i = 0U; __tc_i < __tc_n; __tc_i += 1U) { __tc_frame.data[__tc_i] = static_cast<uint8_t>(__tc_payload[__tc_i]); } __tc_frame.dlc = static_cast<uint8_t>(__tc_n); int __tc_err = can_send(${p}_dev, &__tc_frame, K_MSEC(100), __tc_can_tx_done, NULL); if (__tc_err != 0) { printk("typecad-hal can: send failed: %d` + escapedNl + `", __tc_err); } }`,
+        };
+      }
       const bytes = (o.data ?? []) as (number | string)[];
       if (bytes.length > 8) {
         throw new Error(

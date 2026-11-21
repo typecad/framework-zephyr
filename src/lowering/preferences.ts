@@ -40,6 +40,34 @@ function s(v: unknown): string {
   return String(v);
 }
 
+/** Full settings key: one literal when both halves are literals, a runtime
+ *  std::string concatenation when either half is an expression. The halves
+ *  arrive pre-classified (quoteNonIdentifier: quoted = literal, bare =
+ *  C++ expression); baking both into the template wrote a variable key as
+ *  its SOURCE TEXT — kv.setFloat(name, v) stored under the literal key
+ *  "tc/ns/name", every variable key onto one junk flash slot, masked
+ *  in-session by the RAM cache and exposed only across reboot
+ *  (demo-terra round 10 F11). */
+function fullKey(ns: string, key: string): string {
+  const isLiteral = (v: string) => /^"[^"]*"$/.test(v);
+  if (isLiteral(ns) && isLiteral(key)) {
+    return `"tc/${unq(ns)}/${unq(key)}"`;
+  }
+  return `("tc/" + std::string(${ns}) + "/" + std::string(${key})).c_str()`;
+}
+
+/** Render a bool op field: literal booleans become `true`/`false`, string
+ *  values are the C++ text of a runtime expression and pass through
+ *  verbatim (truthiness of the non-empty string would emit `true`). */
+function boolText(v: boolean | string): string {
+  if (typeof v === "string") {
+    if (v === "true") return "true";
+    if (v === "false") return "false";
+    return v;
+  }
+  return v ? "true" : "false";
+}
+
 // Type tags for the cache slot payload. Scoped enum (AUTOSAR: enum class).
 // The on-metal order matters: these are stored in the `type` byte and matched
 // at h_set time, so do not renumber.
@@ -52,19 +80,38 @@ const TAG = {
 } as const;
 
 /**
- * The preferences runtime shim. All helpers are `static`/`inline` so unused
- * ones don't trip -Wunused-function in the single generated TU (mirrors
- * wifi.ts / http.ts / mqtt.ts).
+ * The preferences runtime shim — a SINGLETON block.
  *
- * The cache is the source of truth at runtime: settings_load() repopulates it
- * once at boot via h_set, and every put / get / remove reads or writes it
- * directly. settings_save_one and settings_delete keep flash in sync on
- * writes; reads never touch flash. This is the same split the ESP32
- * Preferences library uses (NVS is the cache, just in flash-backed RAM pages).
+ * The cache and the `SETTINGS_STATIC_HANDLER_DEFINE` registration must exist
+ * exactly once per PROGRAM, not once per translation unit: a duplicated
+ * handler registers once per TU, so a multi-file program's boot-time
+ * settings_load() fills only the TU that won the link-order race while every
+ * other TU's cache stays empty forever (reads return defaults; session
+ * roundtrips still pass because put/get share one TU). The block therefore
+ * compiles its definitions only in the entry TU (CUTTLEFISH_ENTRY_TU) and
+ * prototypes everywhere else.
+ *
+ * The two guards make ANY include order within one TU safe — a module header
+ * spliced before or after the TU's own shim both settle:
+ *   entry TU, header first  → header takes the prototype branch (no ENTRY_TU
+ *                             define in headers), preamble then defines;
+ *   entry TU, preamble first→ header re-entry sees DEFS set and no-ops;
+ *   plain TU, either order  → the prototype branch fires once.
+ *
+ * Helpers are `static` inside the entry branch so unused ones don't trip
+ * -Wunused-function; the public `__tc_prefs_*` accessors carry external
+ * linkage (single definitions in the entry TU) so every TU links against the
+ * one live cache. This is the same split the ESP32 Preferences library uses
+ * (NVS is the cache, just in flash-backed RAM pages).
  */
 export function preferencesInitLines(): string[] {
   return [
     `// CUTTLEFISH_PREFS_BEGIN`,
+    `#include <string>`,
+    `#include <cstdio>`,
+    `#if defined(CUTTLEFISH_ENTRY_TU)`,
+    `#ifndef CUTTLEFISH_PREFS_SINGLETON_DEFS`,
+    `#define CUTTLEFISH_PREFS_SINGLETON_DEFS`,
     `#define __TC_PREFS_SLOT_COUNT 32`,
     `#define __TC_PREFS_KEY_LEN   48`,
     `#define __TC_PREFS_VAL_LEN   32`,
@@ -92,25 +139,25 @@ export function preferencesInitLines(): string[] {
     `// value via read_cb. We copy it into a cache slot keyed by the full dotted`,
     `// path. h_get/h_commit are unused (the cache is the post-load source of`,
     `// truth) so they return -ENOENT / 0 to satisfy the handler contract.`,
+    `static __tc_prefs_slot* __tc_prefs_slot_for(const char* full);`,
     `static int __tc_prefs_h_set(const char* name, size_t len, settings_read_cb read_cb, void* cb_arg) {`,
     `    (void)len;`,
-    `    for (int i = 0; i < __TC_PREFS_SLOT_COUNT; i++) {`,
-    `        if (!__tc_prefs.slots[i].used) {`,
-    `            // Stash the type byte (first val byte) by reading into the slot.`,
-    `            ssize_t got = read_cb(cb_arg, __tc_prefs.slots[i].val, __TC_PREFS_VAL_LEN);`,
-    `            if (got <= 0) { return static_cast<int>(got); }`,
-    `            __tc_prefs.slots[i].len = static_cast<uint8_t>(got);`,
-    `            // Type is encoded as the first byte of the stored value (see put_*).`,
-    `            __tc_prefs.slots[i].type = __tc_prefs.slots[i].val[0];`,
-    `            // h_set hands us the name RELATIVE to the handler's "tc"`,
-    `            // subtree ("rig/marker") — the cache keys full names, so`,
-    `            // re-attach the prefix or loaded entries never match a lookup.`,
-    `            (void)snprintf(__tc_prefs.slots[i].key, __TC_PREFS_KEY_LEN, "tc/%s", name);`,
-    `            __tc_prefs.slots[i].used = true;`,
-    `            return 0;`,
-    `        }`,
-    `    }`,
-    `    return 0;  // cache full — silently drop (matches ESP32 NVS-full behavior)`,
+    `    // h_set hands us the name RELATIVE to the handler's "tc"`,
+    `    // subtree ("rig/marker") - the cache keys full names, so re-attach the`,
+    `    // prefix and go through slot_for (which EVICTS when the 32 slots are`,
+    `    // full - the free-slot-only loop silently dropped loaded keys once the`,
+    `    // shared settings partition accumulated more keys than the cache).`,
+    `    char full[__TC_PREFS_KEY_LEN];`,
+    `    (void)snprintf(full, sizeof(full), "tc/%s", name);`,
+    `    __tc_prefs_slot* slot = __tc_prefs_slot_for(full);`,
+    `    ssize_t got = read_cb(cb_arg, slot->val, __TC_PREFS_VAL_LEN);`,
+    `    if (got <= 0) { return static_cast<int>(got); }`,
+    `    slot->len = static_cast<uint8_t>(got);`,
+    `    // Type is encoded as the first byte of the stored value (see put_*).`,
+    `    slot->type = slot->val[0];`,
+    `    (void)snprintf(slot->key, __TC_PREFS_KEY_LEN, "%s", full);`,
+    `    slot->used = true;`,
+    `    return 0;`,
     `}`,
     `static int __tc_prefs_h_get(const char* full, char* val, int val_len_max) {`,
     `    (void)full; (void)val; (void)val_len_max;`,
@@ -123,10 +170,17 @@ export function preferencesInitLines(): string[] {
     `// One-time subsystem init + load. Idempotent — the HAL may call begin()`,
     `// repeatedly. settings_subsys_init() is itself idempotent in Zephyr, but the`,
     `// loaded flag short-circuits the (relatively expensive) settings_load() walk.`,
-    `static inline void __tc_prefs_ensure_loaded(void) {`,
+    `static void __tc_prefs_ensure_loaded(void) {`,
     `    if (!__tc_prefs.loaded) {`,
-    `        (void)settings_subsys_init();`,
-    `        (void)settings_load();`,
+    `        // Loud-diagnostics policy: a settings backend that initializes or`,
+    `        // loads with an error makes every Store read silently fall to its`,
+    `        // default while saves still "succeed" into the RAM cache — the`,
+    `        // demo-pumphouse round 5 finding survived to hardware BECAUSE these`,
+    `        // were (void)-cast. Surface the codes once at first use.`,
+    `        int rc = settings_subsys_init();`,
+    `        if (rc != 0) { __tc_println("typecad-hal-store: settings backend init failed"); }`,
+    `        rc = settings_load();`,
+    `        if (rc != 0) { __tc_println("typecad-hal-store: settings load failed (persistence off this boot)"); }`,
     `        __tc_prefs.loaded = true;`,
     `    }`,
     `}`,
@@ -145,16 +199,24 @@ export function preferencesInitLines(): string[] {
     `    return nullptr;`,
     `}`,
     ``,
-    `// Allocate (or reuse) a slot for a full name. Eviction is last-write on a`,
-    `// free slot; a full cache returns nullptr and the put silently no-ops (the`,
-    `// in-RAM value is still returned to the program on get, just not persisted).`,
+    `// Allocate (or reuse) a slot for a full name. Free slots first; a FULL`,
+    `// cache EVICTS round-robin instead of returning nullptr. The settings`,
+    `// partition is shared across every demo ever flashed on the board, so`,
+    `// settings_load() refills the cache with accumulated keys - a full-cache`,
+    `// nullptr made every put silently no-op its cache mirror and every get`,
+    `// miss to the default (doser + gate store.roundtrip [FAIL] on hardware,`,
+    `// reproduced on COM9). The shim comment claiming "the in-RAM value is`,
+    `// still returned on get" was wrong: a nullptr put caches nothing.`,
+    `static uint8_t __tc_prefs_victim = 0;`,
     `static __tc_prefs_slot* __tc_prefs_slot_for(const char* full) {`,
     `    __tc_prefs_slot* existing = __tc_prefs_find(full);`,
     `    if (existing != nullptr) { return existing; }`,
     `    for (int i = 0; i < __TC_PREFS_SLOT_COUNT; i++) {`,
     `        if (!__tc_prefs.slots[i].used) { return &__tc_prefs.slots[i]; }`,
     `    }`,
-    `    return nullptr;`,
+    `    __tc_prefs_slot* victim = &__tc_prefs.slots[__tc_prefs_victim];`,
+    `    __tc_prefs_victim = static_cast<uint8_t>((__tc_prefs_victim + 1U) % __TC_PREFS_SLOT_COUNT);`,
+    `    return victim;`,
     `}`,
     ``,
     `// Generic typed put: stamp the type byte, stash the value, persist via`,
@@ -162,7 +224,7 @@ export function preferencesInitLines(): string[] {
     `// as val[0] so h_set can recover it on the next boot without a separate`,
     `// name→type map.`,
     `template <typename T>`,
-    `static inline void __tc_prefs_put(const char* full, uint8_t tag, const T& value) {`,
+    `static void __tc_prefs_put(const char* full, uint8_t tag, const T& value) {`,
     `    __tc_prefs_ensure_loaded();   // begin() is gone — mount lazily here`,
     `    uint8_t buf[1U + sizeof(T)];`,
     `    buf[0] = tag;`,
@@ -179,7 +241,7 @@ export function preferencesInitLines(): string[] {
     `}`,
     ``,
     `template <typename T>`,
-    `static inline T __tc_prefs_get(const char* full, uint8_t tag, T def) {`,
+    `static T __tc_prefs_get(const char* full, uint8_t tag, T def) {`,
     `    __tc_prefs_ensure_loaded();`,
     `    __tc_prefs_slot* slot = __tc_prefs_find(full);`,
     `    if (slot == nullptr || slot->type != tag || slot->len < (1U + sizeof(T))) {`,
@@ -194,21 +256,24 @@ export function preferencesInitLines(): string[] {
     `// begin records "tc/<ns>/" as the prefix every subsequent key is built under.`,
     `// end clears the prefix (NOT the cache). Both are cheap on Zephyr: the real`,
     ``,
-    `// remove: drop one key from flash and the cache. Falls back to no-op if the`,
-    `// slot isn't cached (settings_delete on a missing key returns -ENOENT, which`,
-    `// we swallow).`,
-    `static inline void __tc_prefs_remove(const char* full) {`,
+    `// remove: drop one key from flash and the cache. Returns whether the`,
+    `// key EXISTED (the ESP32-Preferences parity contract the DSL tests pin)`,
+    `// — an absent key skips the settings_delete call entirely (its -ENOENT`,
+    `// would read as a false removal report and churns the flash).`,
+    `bool __tc_prefs_remove(const char* full) {`,
     `    __tc_prefs_ensure_loaded();`,
-    `    (void)settings_delete(full);`,
     `    __tc_prefs_slot* slot = __tc_prefs_find(full);`,
-    `    if (slot != nullptr) { slot->used = false; }`,
+    `    if (slot == nullptr || !slot->used) { return false; }`,
+    `    (void)settings_delete(full);`,
+    `    slot->used = false;`,
+    `    return true;`,
     `}`,
     ``,
     `// clear: drop every key under the active namespace. We walk the cache (the`,
     `// authoritative list of keys we have written) and settings_delete each whose`,
     `// full name starts with the active ns prefix, then mark the slot free. Only`,
     `// the active namespace is cleared — keys under other namespaces survive.`,
-    `static inline void __tc_prefs_clear(const char* prefix) {`,
+    `void __tc_prefs_clear(const char* prefix) {`,
     `    __tc_prefs_ensure_loaded();`,
     `    const size_t plen = strlen(prefix);`,
     `    for (int i = 0; i < __TC_PREFS_SLOT_COUNT; i++) {`,
@@ -223,43 +288,49 @@ export function preferencesInitLines(): string[] {
     `// ── Typed accessors ─────────────────────────────────────────────────────`,
     `// Each put_* stamps its tag byte and persists; each get_* reads the cache and`,
     `// returns the default on miss/type-mismatch (mirrors ESP32 Preferences).`,
-    `static inline void __tc_prefs_put_int(const char* full, int32_t v) {`,
+    `// External linkage — the ONE definitions live here in the entry TU; every`,
+    `// other TU links against them through the prototypes below.`,
+    `void __tc_prefs_put_int(const char* full, int32_t v) {`,
     `    __tc_prefs_put<int32_t>(full, ${TAG.INT}, v);`,
     `}`,
-    `static inline int32_t __tc_prefs_get_int(const char* full, int32_t def) {`,
+    `int32_t __tc_prefs_get_int(const char* full, int32_t def) {`,
     `    return __tc_prefs_get<int32_t>(full, ${TAG.INT}, def);`,
     `}`,
-    `static inline void __tc_prefs_put_uint(const char* full, uint32_t v) {`,
+    `void __tc_prefs_put_uint(const char* full, uint32_t v) {`,
     `    __tc_prefs_put<uint32_t>(full, ${TAG.UINT}, v);`,
     `}`,
-    `static inline uint32_t __tc_prefs_get_uint(const char* full, uint32_t def) {`,
+    `uint32_t __tc_prefs_get_uint(const char* full, uint32_t def) {`,
     `    return __tc_prefs_get<uint32_t>(full, ${TAG.UINT}, def);`,
     `}`,
-    `static inline void __tc_prefs_put_bool(const char* full, bool v) {`,
+    `void __tc_prefs_put_bool(const char* full, bool v) {`,
     `    uint8_t b = v ? 1U : 0U;`,
     `    __tc_prefs_put<uint8_t>(full, ${TAG.BOOL}, b);`,
     `}`,
-    `static inline bool __tc_prefs_get_bool(const char* full, bool def) {`,
+    `bool __tc_prefs_get_bool(const char* full, bool def) {`,
     `    uint8_t b = __tc_prefs_get<uint8_t>(full, ${TAG.BOOL}, def ? 1U : 0U);`,
     `    return b != 0U;`,
     `}`,
-    `static inline void __tc_prefs_put_float(const char* full, float v) {`,
+    `void __tc_prefs_put_float(const char* full, float v) {`,
     `    __tc_prefs_put<float>(full, ${TAG.FLOAT}, v);`,
     `}`,
-    `static inline float __tc_prefs_get_float(const char* full, float def) {`,
+    `float __tc_prefs_get_float(const char* full, float def) {`,
     `    return __tc_prefs_get<float>(full, ${TAG.FLOAT}, def);`,
     `}`,
     ``,
     `// Strings are length-prefixed into the value buffer (capped at STR_LEN so the`,
     `// whole slot still fits in __TC_PREFS_VAL_LEN). get copies out with a NUL and`,
-    `// returns def when the slot is absent or the wrong type.`,
-    `static inline void __tc_prefs_put_string(const char* full, const char* v) {`,
+    `// returns def when the slot is absent or the wrong type. put takes`,
+    `// const std::string& — string-typed TS values (string unions, class members,`,
+    `// locals) lower as std::string and must bind here without a manual c_str()`,
+    `// the way every other shim boundary already accepts them.`,
+    `void __tc_prefs_put_string(const char* full, const std::string& v) {`,
+    `    const char* vc = v.c_str();`,
     `    __tc_prefs_ensure_loaded();`,
     `    uint8_t buf[1U + __TC_PREFS_STR_LEN];`,
     `    buf[0] = ${TAG.STRING};`,
-    `    size_t n = strlen(v);`,
+    `    size_t n = strlen(vc);`,
     `    if (n > __TC_PREFS_STR_LEN) { n = __TC_PREFS_STR_LEN; }`,
-    `    (void)memcpy(&buf[1], v, n);`,
+    `    (void)memcpy(&buf[1], vc, n);`,
     `    (void)settings_save_one(full, buf, 1U + n);`,
     `    __tc_prefs_slot* slot = __tc_prefs_slot_for(full);`,
     `    if (slot != nullptr) {`,
@@ -270,7 +341,7 @@ export function preferencesInitLines(): string[] {
     `        slot->used = true;`,
     `    }`,
     `}`,
-    `static inline const char* __tc_prefs_get_string(const char* full, const char* def) {`,
+    `const char* __tc_prefs_get_string(const char* full, const char* def) {`,
     `    __tc_prefs_ensure_loaded();`,
     `    static char out[__TC_PREFS_STR_LEN + 1U];`,
     `    __tc_prefs_slot* slot = __tc_prefs_find(full);`,
@@ -283,6 +354,24 @@ export function preferencesInitLines(): string[] {
     `    out[n] = '\\0';`,
     `    return out;`,
     `}`,
+    `#endif // CUTTLEFISH_PREFS_SINGLETON_DEFS`,
+    `#else // !CUTTLEFISH_ENTRY_TU — every other TU links against the one cache`,
+    `#ifndef CUTTLEFISH_PREFS_SINGLETON_DECLS`,
+    `#define CUTTLEFISH_PREFS_SINGLETON_DECLS`,
+    `bool __tc_prefs_remove(const char* full);`,
+    `void __tc_prefs_clear(const char* prefix);`,
+    `void __tc_prefs_put_int(const char* full, int32_t v);`,
+    `int32_t __tc_prefs_get_int(const char* full, int32_t def);`,
+    `void __tc_prefs_put_uint(const char* full, uint32_t v);`,
+    `uint32_t __tc_prefs_get_uint(const char* full, uint32_t def);`,
+    `void __tc_prefs_put_bool(const char* full, bool v);`,
+    `bool __tc_prefs_get_bool(const char* full, bool def);`,
+    `void __tc_prefs_put_float(const char* full, float v);`,
+    `float __tc_prefs_get_float(const char* full, float def);`,
+    `void __tc_prefs_put_string(const char* full, const std::string& v);`,
+    `const char* __tc_prefs_get_string(const char* full, const char* def);`,
+    `#endif // CUTTLEFISH_PREFS_SINGLETON_DECLS`,
+    `#endif // CUTTLEFISH_ENTRY_TU`,
     `// CUTTLEFISH_PREFS_END`,
     ``,
   ];
@@ -301,23 +390,27 @@ export function lowerPreferences(op: HALOpIR): { code?: string; expression?: str
     case 'preferences.clear':
       return { code: `__tc_prefs_clear("tc/${unq(o.ns)}/");` };
     case 'preferences.remove':
-      return { code: `__tc_prefs_remove("tc/${unq(o.ns)}/${unq(o.key)}");` };
+      return { code: `__tc_prefs_remove(${fullKey(o.ns, o.key)});` };
     case 'preferences.put_int':
-      return { code: `__tc_prefs_put_int("tc/${unq(o.ns)}/${unq(o.key)}", ${s(o.value)});` };
+      return { code: `__tc_prefs_put_int(${fullKey(o.ns, o.key)}, ${s(o.value)});` };
     case 'preferences.get_int':
-      return { expression: `__tc_prefs_get_int("tc/${unq(o.ns)}/${unq(o.key)}", ${s(o.defaultValue)})` };
+      return { expression: `__tc_prefs_get_int(${fullKey(o.ns, o.key)}, ${s(o.defaultValue)})` };
     case 'preferences.put_bool':
-      return { code: `__tc_prefs_put_bool("tc/${unq(o.ns)}/${unq(o.key)}", ${o.value ? 'true' : 'false'});` };
+      return { code: `__tc_prefs_put_bool(${fullKey(o.ns, o.key)}, ${boolText(o.value)});` };
     case 'preferences.get_bool':
-      return { expression: `__tc_prefs_get_bool("tc/${unq(o.ns)}/${unq(o.key)}", ${o.defaultValue ? 'true' : 'false'})` };
+      return { expression: `__tc_prefs_get_bool(${fullKey(o.ns, o.key)}, ${boolText(o.defaultValue)})` };
     case 'preferences.put_float':
-      return { code: `__tc_prefs_put_float("tc/${unq(o.ns)}/${unq(o.key)}", ${s(o.value)});` };
+      return { code: `__tc_prefs_put_float(${fullKey(o.ns, o.key)}, ${s(o.value)});` };
     case 'preferences.get_float':
-      return { expression: `__tc_prefs_get_float("tc/${unq(o.ns)}/${unq(o.key)}", ${s(o.defaultValue)})` };
+      // The shim accessor is float (the settings payload is 32-bit); TS
+      // numbers are doubles, so every consumer site compares/assigns the
+      // read against double operands — the raw float expression promoted at
+      // each use (-Wdouble-promotion). Cast once here.
+      return { expression: `static_cast<double>(__tc_prefs_get_float(${fullKey(o.ns, o.key)}, ${s(o.defaultValue)}))` };
     case 'preferences.put_string':
-      return { code: `__tc_prefs_put_string("tc/${unq(o.ns)}/${unq(o.key)}", ${s(o.value)});` };
+      return { code: `__tc_prefs_put_string(${fullKey(o.ns, o.key)}, ${s(o.value)});` };
     case 'preferences.get_string':
-      return { expression: `__tc_prefs_get_string("tc/${unq(o.ns)}/${unq(o.key)}", ${s(o.defaultValue)})` };
+      return { expression: `__tc_prefs_get_string(${fullKey(o.ns, o.key)}, ${s(o.defaultValue)})` };
     default:
       throw new Error(
         `framework-zephyr does not yet support HAL op \`${op.operation}\`. ` +
@@ -325,3 +418,14 @@ export function lowerPreferences(op: HALOpIR): { code?: string; expression?: str
       );
   }
 }
+
+
+// ── Op C++ return types (the single definition site) ─────────────────────
+// Beside the lowering cases that emit them; served to the engine via the
+// strategy's halOpCppType seam (see wifi.ts for the contract).
+export const OP_CPP_RETURN_TYPES: Readonly<Record<string, string>> = {
+  'preferences.get_int': 'int32_t',
+  'preferences.get_bool': 'bool',
+  'preferences.get_float': 'double',
+  'preferences.get_string': 'const char*',
+};

@@ -1,5 +1,687 @@
 # @typecad/framework-zephyr
 
+## 1.0.0-alpha.29
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies
+  - @typecad/cuttlefish@1.0.0-alpha.29
+
+## 1.0.0-alpha.28
+
+### Patch Changes
+
+- ## Ship the alpha.27 changes
+  
+  The `1.0.0-alpha.27` tarballs were published before the release work was
+  finished, so they are missing the CLI output improvements, the safety review
+  fixes, the Wi-Fi radio facts (`wifi-radios`), the updated board gate, and the
+  refreshed bundled editor extension. This release contains all of them. There
+  are no other changes.
+- Updated dependencies
+  - @typecad/cuttlefish@1.0.0-alpha.28
+
+## 1.0.0-alpha.27
+
+### Patch Changes
+
+- Updated dependencies
+  - @typecad/cuttlefish@1.0.0-alpha.27
+
+## 1.0.0-alpha.26
+
+### Patch Changes
+
+- a9ccc34: ## Shallow manifest clone: `west init -o=--depth=1`
+  
+  `zephyr-installer` no longer downloads the full zephyr-rtos/zephyr history
+  (~900 MB of pack data): `west init` now shallow-clones the manifest repository
+  at the pinned tag (`-o=--depth=1` forwards to
+  `git clone --branch <tag> --depth=1`), cutting the workspace step's zephyr
+  clone from 896 MB to 125 MB on the measured rig.
+  
+  Safe because nothing downstream reads zephyr git history: the board catalog,
+  the SBOM, and `licenses` read file trees and `west list` output; the kernel
+  version comes from `$ZEPHYR_BASE/VERSION`. The checkout sits at the pinned tag
+  (`git describe` works), and re-running the installer against the same tag is a
+  no-op fetch, so the clone stays shallow.
+  
+  The west manifest projects are deliberately not depth-limited: zephyr's
+  manifest pins them by SHA, and GitHub rejects `--depth` fetches that resolve a
+  SHA (west fetches all branch refs, then rev-parses the SHA — fails under
+  `--depth`), so `west update` remains a full clone. Mirrored in `install.ps1`
+  and `lib/init-workspace.sh`.
+- @typecad/cuttlefish@1.0.0-alpha.26
+
+## 1.0.0-alpha.25
+
+### Patch Changes
+
+- Updated dependencies [3142206]
+  - @typecad/cuttlefish@1.0.0-alpha.25
+
+## 1.0.0-alpha.24
+
+### Patch Changes
+
+- 3246ff9: Round 11 — the customer-simulation round (demo-sentry): eleven engine fixes, each proven on ESP32-S3 hardware before landing.
+  
+  **The green that lied (tooling trust):**
+  
+  - `trace capture --flash` re-spawned the trace module instead of the CLI —
+    exit 0, zero output, nothing flashed, and the capture recorded whatever
+    firmware was already on the board (a 10-minute "soak" of the wrong binary
+    passed until a stack gate caught it).
+  - The test-runner wire checksum XORed UTF-16 code units while the device
+    XORs bytes — every frame carrying a non-ASCII character arrived "corrupt";
+    the corrupt frame's failed test was silently dropped; and a suite whose
+    frames were all lost printed PASS with `Tests (0)`. The host now XORs the
+    same UTF-8 bytes, orphans surface as a failed `(protocol)` describe, and
+    an empty parse is a hard error.
+  - The scaffolded out-of-box test emitted its whole protocol exchange into
+    the serial port's post-flash reopen gap and timed out on every hardware
+    run — the firmware now settles (`test.warmupMs`, default 2500 ms) before
+    SUITE_START, and the summary separates build from run failures.
+  
+  **Data corruptors and broken emission:**
+  
+  - `Random.upTo(n)` could draw `n` (inclusive off-by-one against its own
+    documented half-open contract) — an out-of-bounds index that aborted the
+    board on hardware.
+  - Lambda bodies rendered through the flat statement renderer, truncating
+    compound statements: a local arrow with an if/else became
+    `auto check = [&](...) -> void { if (ok) };` — not valid C++. Both lambda
+    paths now render structured statements; switch/try inside a lambda body
+    diagnose loudly instead.
+  - A method call through a `this`-capture cell emitted the ill-formed
+    `(*cell)->method()`; class-member callbacks registered twice per call
+    site (two ISRs, two capture cells); and a tree-shaken class left its
+    capture cells behind ("'FleetLink' does not name a type").
+  
+  **The DX cluster — warnings that lied or cried wolf:**
+  
+  - Calling the hal's own `Random.int()` warned "rename 'int'" (property names
+    are exempt now); `create --framework` accepts both the id and the package
+    name; the forEach-on-Map hint no longer recommends the exact `Map.keys()`
+    form the lowering rejects; imported string consts fold as carrier facts
+    (the `{ psk: AP_PSK }` "cannot be carried" warning while the emitted C++
+    carried it fine is gone); and `isNaN(parseInt(...))` — a constant false in
+    the emitted C++ — warns at the exact lying site.
+- Updated dependencies [3246ff9]
+  - @typecad/cuttlefish@1.0.0-alpha.24
+
+## 1.0.0-alpha.23
+
+### Patch Changes
+
+- Demo-driven convergence rounds 5–10: ~60 engine fixes, each proven on ESP32-S3 hardware before landing.
+  
+  **cuttlefish — the data corruptors (values that lied on the wire):**
+  
+  - Runtime Store/Preferences keys compose as expressions when either half is
+    non-literal — `"tc/" + ns + "/" + key` no longer bakes a stale literal, and
+    fact-resolved namespace values are re-quoted before they hit C++ (`F11`).
+  - Inherited methods resolve their return types through the base chain
+    (bounded walk) — `air.source()` through a subclass no longer types as the
+    numeric default and prints `(%d)` garbage (`F7`).
+  - `ble.notify(...)` carries expression arguments through lowering — no more
+    `0.notify` falls (`E2`); uint8 BLE writes deliver their byte; the shim
+    state is ONE firmware-wide instance (named struct types — the anonymous
+    struct `weak` never merged, per-TU copies double-counted) (`F17`).
+  - i2s.write retries through a full TX queue — multi-block programs no
+    longer hit `-EIO` mid-phrase.
+  - Serial reads decode UTF-8 incrementally — no more banner mojibake.
+  
+  **cuttlefish — cross-module programs:**
+  
+  - Cross-module HAL-instance class fields dissolve to ops (`E8`); class-state
+    cluster closed: module-let single definition, cross-module instances
+    render through the pointer (`F8`), module-init flags run AFTER the TU's
+    own definitions (`F9`), a module's self-import emits no include (`F6`).
+  - Interface-return object literals in every context (argument, return,
+    assignment, array element); import cycles rejected loudly at transpile
+    start (`TS2CPP_IMPORT_CYCLE`) instead of emitting broken includes (`F5`);
+    async fire-and-forget boundaries carry diagnostics.
+  - Concatenation-built exported consts are never promoted (`F10`);
+    class-referenced private consts emit module-qualified (`R3` collision
+    class); computed receivers with string return types lower their value
+    methods (`R1` string twin); sibling-class unions coalesce to struct —
+    no more `UNCLASSIFIABLE` noise; ambient `@types` no longer leak DOM
+    globals into firmware programs (`R4`); standalone GCC notes no longer
+    print under the error header (`R6`); reserved-named variables survive
+    tree-shaking.
+  
+  **cuttlefish — engine hardening:**
+  
+  - esp32 wifi programs cap radio TX power at 10 dBm, engine-seeded (the
+    bench brownout fix); `wifi.scan_count` lowers through `static_cast` —
+    strict-clean by construction; polyfill guards are overload-aware;
+    `vector` indexOf/includes take the value as a second template type; a UI
+    mount without a configured display diagnoses the missing config; the GPIO
+    read shim carries a define guard (multi-module UI programs redefine it).
+  
+  **framework-zephyr:**
+  
+  - Synthesized sensor child nodes carry binding-required DT properties
+    (sensirion `sht4x`/`sts4x`/`shtcx` enum-with-default family) — gen2
+    overlays generate instead of failing gen1 validation (`F1`).
+  - `zephyr.trace.alarms` move stack/frame threshold detection onto the
+    device; `.trace(gate, dwellMs)` DSL assertions evaluate host-side over
+    the `it()` window; `trace capture --flash --gates-file` is the one-command
+    agent loop.
+  
+  **hal:**
+  
+  - Testing-DSL surface keeps pace with the engine fixes (trace gate
+    assertions, retire-proof fixture updates).
+- Updated dependencies
+  - @typecad/cuttlefish@1.0.0-alpha.23
+
+## 1.0.0-alpha.22
+
+### Patch Changes
+
+- Sixteen transpiler fixes surfaced by the new `zephyr-bench-supervisor` demo
+  (a two-module STM32 bench exercising Map/Record lowering, cross-module
+  interface polymorphism, enum↔number boundaries, byte-wise UART parsing, and
+  string formatting):
+  
+  - `map.get(k) ?? d` lowered to `cuttlefish_nullish(m.at(k), d)` — `.at()`
+    throws on a miss and the nullish helper evaluates both arguments, so the
+    fallback could never fire. It now lowers to the count-guarded
+    `(m.count(k) != 0 ? m.at(k) : d)` (the type-checker gate that rejected the
+    shape is relaxed to match), the `??` declaration typing prefers the map's
+    value type, and enum keys (bare identifiers, enum members, and enum-typed
+    instance fields like `cmd.verb`) cast to the map's key type — including
+    the double keys `Map<number, V>` produces.
+  - Interfaces are pointer-typed everywhere (params, fields, containers,
+    returns): an interface lowers to an abstract C++ struct, so
+    `std::vector<Handler>` could not instantiate it and passing by value
+    would slice the virtual dispatch. Cross-module interfaces (imported from
+    another file) now register in a pre-scanned name set, so a
+    `Map<number, CommandHandler>` declared outside the interface's file
+    pointer-izes too — and a class `implements`-ing an imported interface
+    attaches the `: public Iface` base (it was silently dropped). Interface
+    `===` is now a valid pointer-identity comparison instead of a hard error.
+  - Enum values crossing into `number`-annotated call parameters cast
+    (`static_cast<int>`) — statement and expression calls, free functions
+    (param types resolved from the declaration), and class methods (from the
+    class registry). A parameter of the SAME enum type takes the value
+    directly; the cast is param-type aware.
+  - `Number.isNaN/isFinite/parseInt/parseFloat` (the static forms) lower like
+    the bare globals — they previously emitted verbatim, which is not C++.
+    parseInt/parseFloat no longer grow `.c_str()` when fed a `__tc_*` string
+    helper's const char* result.
+  - `x.length = 0` on a vector/StaticArray/string lowers to `x.clear()` (the
+    read form's `static_cast<long long>(x.size())` was being assigned to — a
+    cast is not an lvalue); a nonzero length assignment now fails loudly.
+  - `.pop()`/`.push()` on a class-field vector receiver (`this._buf.pop()`)
+    lower to `pop_back`/`push_back` — the array-method path only recognized
+    identifier receivers. Identifier receivers keep the StaticArray
+    promotion prediction.
+  - JS bitwise expressions (`| 0`, `& mask`) type `int`, and real-typed array
+    indexes cast at both element reads and element-assign targets
+    (`this->_events[static_cast<int>(i)]`); a real-typed switch discriminant
+    reached through element access casts too.
+  - A getter accessed through a class FIELD (`this._log.size`) lowers to the
+    accessor call (`this->_log->getSize()`), matching the instance/static/
+    `this.` forms fixed earlier.
+  - `Record` literals initialize their map field-by-field (`HELP["k"] = v`)
+    instead of the ill-formed braced value-only initializer, dot access on a
+    Record lowers to element access (any key, even ones named like std::map
+    members), and a Record/Map element in a template literal formats by the
+    VALUE type (it defaulted to numeric and produced
+    `std::to_string(const char*)`).
+  - A function-typed variable (`const f = (x): string => …`) joins the
+    cross-module return-type registry, so `${f(x)}` picks `%s` (it printed a
+    pointer through `%d`). `n.toString(16)` in a template also formats `%s`
+    (`__tc_num_radix` returns const char*), and the `%.15g` snprintf buffer
+    estimate covers the directive's real 22-byte worst case
+    (-Wformat-truncation).
+  - Exported free functions' split-mode header prototypes are hoisted ABOVE
+    the classes (inline class bodies in the header call them; the prototype
+    used to ride with the .cpp-side definition), and every `__tc_*` string
+    polyfill definition is `inline` — a second TU including the block linked
+    with multiple-definition errors. The polyfills also gained std::string
+    receiver overloads and a `__tc_split` definition (Zephyr had none —
+    `.split()` calls linked against nothing), with `startsWith`/`includes`
+    routed through the helpers so a std::string receiver compiles; the
+    result ring (num_radix included) rotates CUTTLEFISH_STR_SLOTS slots.
+  - A `const s = ''; s += x` accumulator loop rebinds through a static buffer
+    while READING it — `snprintf(buf, "%s…", buf, …)` is UB from the second
+    iteration. The target now rides a `std::string` temp copy.
+- Eleven transpiler fixes surfaced by the new `zephyr-climate-fan` demo (a
+  two-module STM32 bench exercising enums, interfaces, inheritance, statics,
+  getters, cross-file imports, and the settings store):
+  
+  - Cross-file imports written in the ESM style (`'./control.js'`) fell through
+    local-header resolution to the PascalCase fallback and emitted
+    `#include <Control.h>` — a header that doesn't exist and the wrong case on
+    case-sensitive filesystems. The `.js`/`.mjs` suffix is now stripped before
+    candidate generation, emitting `#include "control.h"`.
+  - TypeScript default parameter values were silently dropped from emitted
+    class constructors and methods, so call sites relying on them
+    (`Pid.bench()` → 3 args) failed to compile against the 4-parameter
+    constructor. Class-body declarations now carry `param = default`.
+  - Getter access on a class instance (`pid.integral`) lowered to a field read
+    of the PRIVATE backing member instead of the accessor call — a compile
+    error, and wrong where the getter computes. Getters now lower to
+    `pid->getIntegral()` everywhere (own, inherited through `extends`, static
+    `Cls::getProp()`, and `this->getProp()` inside class bodies), and the
+    snprintf specifier ladder resolves the accessor's return type.
+  - A free-function call inside a template literal (`${modeLabel(mode)}`) fell
+    to the `%d` default even when the function returns `const char*` — printing
+    a pointer value on device. Annotated top-level function returns are now
+    pre-scanned across the graph (plus the file's own) into a registry the
+    IR-time specifier ladder consults; static field reads (`Pid::constructed`)
+    and `%g`-formatted identifier args got the same treatment
+    (`static_cast<double>` guards keep varargs calls type-correct).
+  - A `let mode: FanMode = settings.getInt(...)` declaration lost its enum
+    annotation to `auto`, making every `mode == FanMode::Off` comparison and
+    enum-parameter call ill-formed C++ (scoped enums have no implicit int
+    conversion). The declared type is preserved, the read is cast
+    `static_cast<FanMode>(...)`, and enum-typed identifiers passed to
+    `number`-annotated HAL parameters (`setInt`) cast down with
+    `static_cast<int32_t>`.
+  - ISR-shared globals marked `volatile` on their definition conflicted with
+    the plain `bool x;` extern in the split-mode header; the extern now carries
+    the qualifier.
+  - Static data-member definitions (`double Pid::constructed = 0;`) were baked
+    into the class header, defining the symbol in every including TU and
+    failing the link with multiple-definition. Split mode now keeps exactly one
+    definition, in the class's own module .cpp.
+  - An enum MEMBER argument to a number-annotated HAL parameter rendered as
+    `FanMode::Boost` with no cast — the raw shim parameter is `int32_t` and a
+    scoped enum has no implicit conversion. The enum→int cast that already
+    handled identifiers now also fires for enum member accesses.
+  - Store `get_*` defaults that were not plain integer literals were silently
+    REPLACED BY 0: `resolveNumericArg` returned null for any non-numeric text
+    (enum members, variables, call expressions — and for float literals, whose
+    C++ render `1.5f` failed `Number()`), and the op builder's `?? 0` filled
+    the hole. `settings.getInt('mode', FanMode.Auto)` booted in Off (0)
+    instead of Auto (1); `getFloat('f', 1.5)` carried 0. Defaults now fold
+    when numeric and otherwise ride the op as C++ expression text.
+  - Store bool ops folded their argument with `value === "true"`:
+    `setBool('f', flag)` wrote false for EVERY variable, and a runtime default
+    in `getBool` collapsed to false the same way. Literal true/false still
+    fold; expressions pass through verbatim (`boolean | string` op fields,
+    the lowering renders string fields as-is instead of truthiness-coercing).
+  - Store string ops `quoteNonIdentifier`'d the resolved argument, baking a
+    `getString('n', fallbackName())` call into the LITERAL "fallbackName()".
+    Values/defaults emit the resolver's C++ text verbatim (ns/key still
+    literalize — they name settings paths).
+  - A negative float literal (`const ALARM_FLOOR_C = -5.0`) is a prefix-unary
+    over the number, which the declaration type inference didn't handle: it
+    inferred `auto` where the positive sibling inferred `double`, and
+    split-mode skips auto-typed globals, so the constant also vanished from
+    the header's extern list. Prefix-unary now infers from its operand.
+  - The `__tc_*` string-method polyfills returned pointers into a TWO-slot
+    rotating static buffer, but a printf argument list is fully evaluated
+    before the call: the demo's status line carries FOUR `__tc_toFixed`
+    calls, so calls 3/4 overwrote calls 1/2 and the line printed the setpoint
+    value for the temperature. The ring is now `CUTTLEFISH_STR_SLOTS` (8,
+    power-of-two mask advance) slots deep.
+- Zephyr adopts the ONE string model: std::string end to end, deleting the
+  const char* + rotating-static-ring implementation and its whole bug class
+  (follow-up to the structural-consolidation changeset; surfaced by the
+  climate-fan and bench-supervisor demos):
+  
+  - **Polyfills return std::string BY VALUE.** Every `__tc_*` string/number
+    helper takes `const std::string&` (a const char* literal converts
+    implicitly) and returns an owned std::string. The eleven rotating static
+    result rings are GONE — the aliasing ceiling ("N live results need N ring
+    slots"; the four-toFixed-calls-in-one-printf bug) no longer exists because
+    every result owns its storage. Zephyr links with REQUIRES_FULL_LIBCPP,
+    and short results ride std::string's SSO, so typical fixed-point
+    formatting never touches the heap. Measured on the bench-supervisor demo:
+    flash +0.8 KB (string methods), RAM −2.1 KB (rings removed).
+  - **normalizeCppType keeps std::string** (variables, container elements,
+    function returns) instead of remapping to const char*. String comparisons
+    lower to native `a == b` / `a < b` (JS reference/content semantics
+    directly), `.length` to `.length()`, startsWith to the prefix idiom.
+    `.c_str()` appears ONLY at C-varargs boundaries — snprintf argument
+    shaping already handled it via needsCStrForStringLike; the IR-time
+    snprintf builder and the `atoi`/`atof` shaper now route std::string-
+    classified arguments through the same adaptation (registry-driven).
+  - **HAL string boundary**: a `string`-annotated parameter (`write(data:
+    SerialValue)`) lowers to a const char* shim; std::string arguments —
+    owned locals, helper results, string container elements, string-returning
+    method calls (interpolation-wrapped shapes unwrapped) — take `.c_str()`
+    at the call site, the same seam the enum→int casts use. Store
+    put_string/get_string values/defaults get the same treatment.
+  - **Runtime-initialized constants get linkage**: a `charCodeAt`-initialized
+    module constant now infers a concrete type (`int`) — prototype-method
+    returns classify through the helper-return registry — and split mode
+    emits a header `extern const T name;` for it (the prior-extern linkage
+    rule, the same mechanism the literal constants already use). Inline class
+    bodies in the module's header can read the symbol; the demo's ASCII-code
+    constants are `charCodeAt(0)` initializers again (the workaround is
+    reverted).
+  - The `.split()` polyfill definition now takes `const std::string&`
+    directly, and the `__tc_str_ptr` receiver wrap is dropped (the helper was
+    never defined on Zephyr — a latent gap the model flip removes).
+  
+  Known sharp edge remaining (documented in the bench-supervisor README): a
+  top-level variable named like a libc function (`log`) still renames its
+  declaration but not its references.
+- Eight fixes surfaced by the new `zephyr-shell-logger` demo (round 3 of the
+  find-issues series: a $CMD,field*CS sentence shell over USB CDC with a
+  littlefs settings file and an async boot — the first demo on the USB/File/
+  async surface):
+  
+  - **parseInt dropped its radix**: `parseInt('2A', 16)` lowered to base-10
+    `atoi`, parsing as 2 — every hex checksum in the shell's grammar failed.
+    A literal radix 16/8/2 now lowers to `strtol(..., nullptr, base)` at both
+    the global and Number.parseInt call sites.
+  - **USB-only programs lost the shared write helper**: `__tc_dev_put` serves
+    UART and CDC writes but rode the CUTTLEFISH_UART marker family, which the
+    emit backstop strips whenever usesUart is false. It now carries its own
+    CUTTLEFISH_SERIAL_WRITE marker pair, stripped only when neither serial
+    surface is used.
+  - **The File path is a construction fact**: `new File(SETTINGS_PATH)` with
+    a NAMED string constant left `_path` uncaptured and every fs op baked the
+    literal `this->_path` (compile error). The capture const-folds named
+    constants via the new resolveConstStringExpr (mirroring the Watchdog
+    numeric fold).
+  - **fs.write_text content was literalized**: `quoteNonIdentifier` baked a
+    call expression into a string LITERAL (the store put_string bug class,
+    now on the fs path). Content passes verbatim; std::string values take
+    `.c_str()` at the shim boundary.
+  - **for-of over a string is compilable**: the `const char* it, ch = *it`
+    for-header declarator made `ch` a CONST CHAR (the pointer binds to the
+    declarator), so its per-iteration reassignment was ill-formed — and the
+    one-string-model charCodeAt takes const std::string&, which a char does
+    not convert to. Lowered to an index loop over a once-evaluated string
+    copy with a mutable char loop var; char/charAt/charCodeAt gained char
+    overloads.
+  - **Gates agree with the lowerings**: Number.parseInt/parseFloat/isFinite/
+    isNaN ARE lowered (round 2) but the eslint selector and the semantic
+    prescan still banned all Number statics — only isInteger/isSafeInteger
+    stay banned. `no-destructured-without-init` no longer fires on for-of
+    declarators (the supported destructuring shape — its guard also checked
+    the wrong AST level).
+  - **usb.read casts via static_cast**: the C-style `(int)__b` tripped
+    AUTOSAR M5-0-7 under --autosar=strict.
+  - **Map method receivers resolve through classFields**: a plain
+    (non-??-guarded) `.get()` on a `this._map` field emitted verbatim
+    (`std::map` has no `.get`) — the receiver resolution now consults the
+    class-field map, and an `identifier.field` receiver resolves its type
+    through the owning class IR so ambiguous string/array methods dispatch
+    correctly.
+  
+  Also updates four stale expectations from the newer main-stack-floor,
+  shadow-struct-uniquing, and pop-contract commits (kconfig 8192, packet-lab
+  uniqued struct name, bench-supervisor __tc_pop), which were failing on
+  main before this change.
+- `zephyr.buses` — config-specified bus pin assignments for the ESP32 pin
+  matrix (answers "esp32's have all common peripherals; they are defined by
+  specifying which pin does what"):
+  
+  ```ts
+  zephyr: {
+    buses: {
+      i2c0: { sda: 8, scl: 9 },
+      spi0: { sck: 12, mosi: 11, miso: 13 },   // SPI0 = the SoC's GPSPI2
+      uart1: { tx: 17, rx: 18 },
+    },
+  }
+  ```
+  
+  - **Config surface**: `zephyr.buses` in typecad-hal.config.ts — keys are HAL
+    bus selectors, values name the pads. Validated by the Zod schema
+    (record of records of numbers) and parsed by
+    `framework-zephyr/src/boardgen/bus-pins.ts` (unit-tested): I2C needs both
+    sda+scl, SPI at least sck+mosi, UART both tx+rx; unknown keys and
+    non-ESP32 SoCs warn and skip (fixed-pin silicon: pins come from the board
+    devicetree — the honest limitation).
+  - **One source of truth**: each spec becomes a bus controller in the
+    generated board module — the singleton export (`I2C0`), the
+    `peripherals.i2c.count` capacity constant (the peripheral validator
+    accepts the bus), and the `zephyr.i2c.controllers.N.pinctrl.*` constants
+    the chip reconstruction reads. The C++ shims and the overlay both flow
+    from those constants, so there is no second path to drift. A pin edit
+    joins the board module's regeneration fingerprint.
+  - **Overlay synthesis**: the controller enable block emits a `&pinctrl`
+    remux group using the SoC pinctrl headers' named macros
+    (`I2C0_SDA_GPIO8`, `SPIM2_SCLK_GPIO12`), with the include chain the
+    reference board dtsis use (`esp-pinctrl-common.h` + `<soc>-pinctrl.h` +
+    `<soc>-gpio-sigmap.h` — without the sigmap header the macros expand to a
+    bare identifier the DT grammar rejects). The group label is
+    `<nodeLabel>_tc_remux` — the board's own `<label>_default` group may
+    already exist, and redefining it is a DT error.
+  - **DT cell fix (found by the chain)**: synthesized `pinmux` values now emit
+    as separate bracketed cells (`<A>, <B>` — the reference dtsis' form); a
+    comma inside one bracket is a DT grammar parse error. Overlay include
+    values may be comma-joined chains (one `#include` per header).
+  - **The esp32s3 rig gains the I2C suite**: the devkitC config remuxes i2c0
+    onto GPIO8/9 (free pads), the `i2cBus` role returns to its test-pins, and
+    `09-i2c` — previously skipping by capacity — transpiles AND west-compiles
+    for the board (verified: the merged devicetree enables `i2c0` with
+    `pinctrl-0 = <&i2c0_tc_remux>`, and the C++ shims address
+    `DEVICE_DT_GET(DT_NODELABEL(i2c0))`). The verify script forwards the
+    board config's `zephyr` section into its derived per-test config, and
+    `tests/README.md` documents the section.
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+  - @typecad/cuttlefish@1.0.0-alpha.22
+
+## 1.0.0-alpha.21
+
+### Minor Changes
+
+- e4c9f40: Port-gap fixes — engine gaps surfaced by porting real Arduino/C++ firmware
+  (the Mod-EC I2C salinity slave), each reproduced by a test in
+  `tests/packages/cuttlefish/port-gap-fixes.test.ts`:
+  
+  - **Math builtins with no `std::` equivalent.** `Math.fround` lowers to
+    `static_cast<float>(...)` and `Math.sign` to a NaN-preserving ternary —
+    the old generic fallback emitted `std::fround`/`std::sign`, which do not
+    exist. The global `Infinity`/`NaN` identifiers lower to the `INFINITY`/
+    `NAN` macros and trip the math-header include scan.
+  - **Method-bearing interfaces now emit.** A TS interface with methods
+    (KeyValueStore) used to emit NOTHING — every reference to the type was
+    undefined in C++. It now lowers to an abstract struct (pure-virtual
+    methods + virtual dtor); `implements` of a method-bearing interface
+    emits real inheritance. Field-only interfaces stay plain aggregate
+    structs.
+  - **Class-field initializer inference.** An un-annotated field no longer
+    falls back to `auto` (illegal on non-static members): fractional
+    literals infer `double`, `new X()` infers `X*`. A double-typed field
+    also stamps its numeric initializer so `double k = 0.019` keeps f64
+    precision instead of rounding through a float `f` suffix.
+  - **Getter const-qualification is now call-graph safe.** Getters were
+    unconditionally `const`; one calling a non-const sibling did not
+    compile. A per-class fixpoint now qualifies only getters that write no
+    receiver member and call no non-const sibling (getter-to-getter chains
+    included).
+  - **`.fill()` on embedded arrays.** The `__tc_StaticArray` wrapper gained
+    `fill` (both arities), a `std::vector` receiver on a no-STL target
+    lowers to `std::fill` (+ `<algorithm>`), and the static_array polyfill
+    is now gated on the variable's TYPE (analysis also covers hoisted HAL
+    callback bodies), so the wrapper's definition always ships when the
+    type is used.
+  - **Top-level runtime vars referenced only as receivers of nested calls**
+    (`f(probe.measure())`) are promoted to file-scope globals like every
+    other function-referenced var — the identifier scan now covers
+    call/method-call expressions in argument position.
+  - **HAL-object class fields.** A field initialized with
+    `new <HALClass>(...)` resolves its `this.field` HAL calls to real ops
+    (previously raw text naming the nonexistent C++ class) and emits no C++
+    declaration; `instance.field` receivers resolve in any module build
+    order (the instance rides the class IR). The HAL ctor map now
+    understands the `typeof x === 'number' ? x : x.number` narrowing idiom
+    and resolves pin-constant args (`GPIO4` → 4).
+  - **Bitwise ops on real-typed operands** (`Math.trunc(x) & 0xff`, the
+    canonical port pattern) cast through `static_cast<int>` — C++ has no
+    `double & int`; compound assignments (`x &= 0xff` on a double) rewrite to
+    the same cast form. `Math.trunc` (and the other real-returning Math
+    methods) now report `double` to expression inference.
+  - **Round 2 (sibling sweep of the same classes).** `Math.clz32`/`Math.imul`
+    lower to real expressions (no `std::clz32`/`std::imul` exists).
+    `Number(x)` casts (string args parse via `atof`); `parseInt`/`parseFloat`
+    only grow `.c_str()` for genuine `std::string` args. Un-annotated function
+    params default to `double` — the old `const auto& x` is illegal C++14 on
+    the embedded targets. `new Array<E>(n)`/`new Map<K,V>()`/`new Set<T>()`
+    infer their value-container types instead of nonexistent `Array<E>*`/
+    `Map<K,V>*` pointers. The `__tc_StaticArray` wrapper gained
+    `shift`/`unshift`/`includes`/`lastIndexOf`, and array receivers emit
+    structured method-call IR with a parenthesized receiver so the
+    strategy-level string-method regex can no longer hijack them
+    (`a.includes(2)` used to become `strstr(a, 2)`). `array.join()` and
+    `Map.keys()` fail the transpile with actionable diagnostics on targets
+    that have no lowering for them. The HAL registry now warms before the
+    cross-module class prebuild, and instance-field HAL receivers prefer the
+    import-resolved field map — so `probe.pin.onInterrupt(...)` in the entry
+    file resolves with the pin constant folded regardless of module build
+    order.
+  - **Round 3 (std:: surface audit).** Every std function the engine emits
+    now carries its header and its target exists: the math-include scan
+    covers the full emitted set (`isnan`/`isfinite`/`log2`/`hypot`/`cbrt`/
+    hyperbolics shipped with no `<cmath>`); `Math.round` uses the JS half-up
+    rule (`std::floor(x + 0.5)`, not `std::round`'s half-away-from-zero);
+    `new Error(...)` as a value infers `std::runtime_error` (not the
+    nonexistent `Error*`) and registers `<stdexcept>` on hosted targets,
+    while on no-exception targets it fails loudly — `throw new Error(...)`
+    still lowers to `cuttlefish_halt` there; regex literals register
+    `<regex>` and `/re/.test(s)` lowers to `std::regex_search` (the old form
+    called a nonexistent `.test` member); discriminated unions (`std::variant`,
+    C++17) fail loudly on C++14 embedded targets instead of shipping a header
+    the toolchain rejects — and the long-dead `<variant>` include registration
+    (unreachable after a `return`) is now live; `parseInt`/`parseFloat`/number-
+    parsing `Number()` register `<cstdlib>`.
+  - **Round 4 (transport audit).** Runtime buffers handed to I2C ops are now
+    type-aware: `resp.write(number[])`/`i2c.write(number[])` with a
+    `std::vector` argument size with `.size()`/`.data()` — the old path used
+    C `sizeof`, which on a vector is the container object's own size
+    (garbage-length heap read/OOB write). C-array buffers keep the `sizeof`
+    path. Found while auditing the Mod-EC port's transport: the response
+    staging now uses a fixed `Uint8Array` (a C array — no heap allocation in
+    interrupt context) handed over with ONE whole-buffer write (the per-byte
+    loop it replaced left only the last byte in the response buffer), and the
+    port's live I2C re-address (the original firmware's TASK_I2C) is
+    implemented through `rawCpp` — unregister, rewrite the responder config's
+    address, re-register.
+  - **Round 5 (control flow, characters, and dictionary annotations).**
+    String comparisons no longer compare ADDRESSES: `const char*` equality
+    (`s1 === s2`) and relational (`s1 < s2`) lower to `strcmp`, as does
+    `switch` on a string parameter (the wrap heuristic missed exactly the
+    const-char* case). `s[0] === "a"` compares the char against a char
+    literal (it emitted `strcmp(char, const char*)`), `s[0] === "ab"` folds
+    to `false` (a char is never a 2-char string), and `s[0] + "x"` formats
+    the character with `%c` (the old path printed its code point, "97x").
+    `v.toString(16)` lowers to a new `__tc_num_radix` helper (it emitted
+    verbatim); no-arg `toString()` keeps fractional precision. for-of over a
+    string lowers to an index loop (a range-for over `const char*` does not
+    compile). An index-signature annotation (`{ [k: string]: number }`)
+    resolves to `std::map` (it synthesized an empty struct, so every
+    `m["key"]` failed). `===` on interface-typed values fails loudly (structs
+    have no identity — compare fields or use a class); class-instance `===`
+    keeps correct pointer-identity semantics.
+  - **Honest failures instead of broken C++.** A HAL factory used directly
+    in an expression, an i2c responder whose address is a runtime
+    expression, and a member method passed as an interrupt/responder
+    handler each fail the transpile with an actionable diagnostic instead
+    of silently emitting unbindable C function pointers or raw TS text.
+  - **Contract boardgen carries the gated hardware surface.** The narrowed
+    contract board.ts re-exports the gated classes the framework's board
+    module resolved (I2CTarget/I2CResponder on a wired bus, Store/File on a
+    storage region, ...) — previously a contract board could not even name
+    its own peripherals' classes. Storage facts come from the soc's dtsi
+    family (smallest declared module size) or, when the project names a
+    build target, from that board's catalog record — so the overlay never
+    synthesizes a second `storage_partition` against a board that ships
+    one (a dtc duplicate-label error).
+  
+  Verified end-to-end by re-transpiling and west-compiling the Mod-EC port
+  for esp32s3_devkitc: all ten generated TUs compile and link to
+  zephyr.elf.
+  - **Round 6 (transpile→compile→run audit matrix).** A 131-case matrix that
+    transpiles, g++-compiles, RUNS the emitted program and diffs stdout against
+    real JS semantics (plus a Zephyr shape-classification pass) surfaced — and
+    this round fixes — the following, each pinned by a Round 6 test:
+    - **Math include scan**: `Math.exp`/`Math.log` emitted `std::exp`/`std::log`
+      with no `<cmath>` (missing from `MATH_PATTERN`); real `%` lowered to a
+      bare unprefixed `fmod(` (invisible to the scan) — now `std::fmod` with an
+      unconditional `%`→math-header flag; `**` emits qualified `std::pow`.
+    - **JS operator semantics**: `a || b`/`a && b` in VALUE position collapsed
+      to C++ bools (`0 || 5` → `true`). They now lower to the short-circuit
+      ternary `(a) ? (a) : (b)` — operand semantics without losing
+      short-circuit; condition positions (`if`/`while`/`for`/`do`/`!`/ternary
+      conditions) keep the C++ operators verbatim. Literal `/` promotes to
+      real division (`7 / 2` truncated to 3) via
+      `promoteDivisionToDouble()` on the generic strategy.
+    - **Silent truncation**: `Number("3.5")`/`parseFloat("1.5")` declared
+      `const int a = atof(...)` — value corrupted at compile time; the
+      conversion globals now infer `double` (`parseInt` → `int`), and
+      `Number(string)` registers the `<cstdlib>` its `atof` needs.
+    - **Object.prototype lookup trap**: the array-method lookup tables were
+      plain objects, so `n.toString(16)` resolved `VECTOR_CALLBACK_METHOD_
+      HELPERS["toString"]` to the INHERITED Function — a method-call IR node
+      with a function callee crashed the analysis pass
+      (`expr.callee.includes is not a function`). Tables are now
+      prototype-free, and the analysis skips a non-string callee defensively.
+    - **Generic (fallback) strategy ships its runtime surface**: it returned no
+      shim and no polyfills, so on `target: "generic"` every string/array
+      method called undefined `__tc_*` helpers, `??` referenced an undefined
+      `cuttlefish_nullish`, and array literals promoted to a `__tc_StaticArray`
+      that was never defined. The hosted core shim + polyfill table are
+      extracted to `frameworks/native/hosted-shim.ts` and shared by both
+      strategies; the generic target stops promoting to StaticArray (vectors
+      are its array form) and promotes division like native.
+    - **String-method receivers**: the prescan marks any `.indexOf`/`.includes`
+      receiver a mutable array (syntactic), which poisoned STRING variables —
+      `s.toUpperCase()` after an `s.indexOf(...)` stayed verbatim, and
+      `s.includes(...)` on a param never lowered (params had no scope type).
+      The gate now lets a resolved string-like type win over the array
+      presumption, string LITERALS resolve, and `indexOf`/`includes` lower
+      through the overload-based helpers (string and vector receivers both
+      resolve). `"hello".substring(1, 3)` and `.slice(-2)` work.
+    - **Containers/exceptions/rest**: `for (const [k, v] of map)` types the
+      loop var `std::pair<const K, V>` and extracts via `std::get<N>` (the
+      emit-side renderer gained `tuple-access`); rest-param calls collect
+      plain args into the declared `std::vector<Elem>{...}` (spread calls
+      still pass the vector directly); `catch (e)` with the body referencing
+      `e` emits the rethrow-and-cast binding and `(e as Error).message`
+      lowers to `.what()`; the string_methods polyfill block declares the
+      `<vector>` its split/slice helpers need.
+    - **Map iteration gate**: the `Map.keys()/values()/entries()` unsupported
+      diagnostic fired on EVERY target — including hosted ones that ship the
+      `__tc_map*` helpers, breaking the demo-15 lowerings. It now fires only on
+      no-STL targets; hosted targets lower to the helpers.
+- b4bceae: Contract projects can now declare `storageKb` in typecad-hal.config.ts —
+  the on-chip flash size in KB — which gates in the persistent Store/File
+  surface when neither the soc-dtsi flash harvest nor a buildTarget catalog
+  record declares a size. External-flash boards (RP2040/ESP32 class) declare
+  flash in the board dts, which the soc-dtsi harvest can never see, so their
+  contract boards silently shipped without Store and users had to shim
+  around the gate with raw settings access. The declaration overrides the
+  dtsi harvest; a buildTarget catalog record still wins (it is the tree west
+  actually compiles against).
+
+### Patch Changes
+
+- Updated dependencies [e4c9f40]
+- Updated dependencies [b4bceae]
+- Updated dependencies [b4bceae]
+- Updated dependencies [e4c9f40]
+- Updated dependencies [823df94]
+  - @typecad/cuttlefish@1.0.0-alpha.21
+
+## 1.0.0-alpha.20
+
+### Patch Changes
+
+- Updated dependencies [a3a9459]
+  - @typecad/cuttlefish@1.0.0-alpha.20
+
 ## 1.0.0-alpha.19
 
 ### Minor Changes

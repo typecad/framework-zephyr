@@ -14,6 +14,8 @@
 
 import type { BoardConstants } from '@typecad/cuttlefish/api/shared';
 import type {
+
+
   ZephyrChipDescriptor,
   ZephyrProbeMethod,
   ZephyrGpioDtSpec,
@@ -24,6 +26,19 @@ import type {
   ZephyrAdcChannel,
   ZephyrDacChannel,
 } from './types.js';
+
+// SoC families whose silicon routes ANY pad to ANY peripheral signal (the
+// ESP32 family's GPIO matrix). DATA, keyed on the soc segment like every
+// family convention (pin naming, nodelabel maps) — never a code-path
+// branch: consumers read the descriptor's `busPinRemux` FACT.
+const BUS_PIN_REMUX_SOCS = /^esp32/;
+
+/** The `busPinRemux` fact for a soc name — the single derivation the
+ *  descriptor resolver and the board-module generator both read. */
+export function socSupportsBusPinRemux(soc: string | undefined): boolean {
+  return soc !== undefined && BUS_PIN_REMUX_SOCS.test(soc);
+}
+
 
 /** Collect an indexed array of objects reconstructed from flat dot-path keys. */
 function collectIndexed<T>(
@@ -63,6 +78,7 @@ function collectBusControllers(
     const inputPinmux = splitCsv(m.get(`${prefix}.${i}.pinctrl.inputPinmux`));
     const defines = splitCsv(m.get(`${prefix}.${i}.pinctrl.defines`));
     const pinctrlRef = m.get(`${prefix}.${i}.pinctrlRef`) as string | undefined;
+    const pinctrlGroupName = m.get(`${prefix}.${i}.pinctrlGroupName`) as string | undefined;
     const props = splitCsv(m.get(`${prefix}.${i}.props`));
     return {
       nodeLabel,
@@ -77,6 +93,7 @@ function collectBusControllers(
           }
         : {}),
       ...(pinctrlRef ? { pinctrlRef } : {}),
+      ...(pinctrlGroupName ? { pinctrlGroupName } : {}),
       ...(props ? { props } : {}),
     };
   });
@@ -143,6 +160,16 @@ export function resolveChipFromBoard(
   const i2cControllers = collectBusControllers(bc, 'zephyr.i2c.controllers');
   const spiControllers = collectBusControllers(bc, 'zephyr.spi.controllers');
   const uartControllers = collectBusControllers(bc, 'zephyr.uart.controllers');
+  // Binding identity per wired controller (zephyr.<bus>.compatibles.
+  // <nodelabel>) — the overlay reads it for binding-specific properties.
+  const withCompatible = (cs: ZephyrBusController[], bus: 'i2c' | 'spi' | 'uart'): ZephyrBusController[] =>
+    cs.map((c) => {
+      const compatible = bc.get(`zephyr.${bus}.compatibles.${c.nodeLabel}`) as string | undefined;
+      return compatible ? { ...c, compatible } : c;
+    });
+  const i2cTyped = withCompatible(i2cControllers, 'i2c');
+  const spiTyped = withCompatible(spiControllers, 'spi');
+  const uartTyped = withCompatible(uartControllers, 'uart');
 
   const pwmSpecs = collectIndexed<ZephyrPwmSpec>(bc, 'zephyr.pwm.specs', (m, i) => {
     const pin = m.get(`zephyr.pwm.specs.${i}.pin`) as number;
@@ -216,8 +243,13 @@ export function resolveChipFromBoard(
   const hwtimerControllers = collectIndexed<ZephyrBusController>(bc, 'zephyr.hwtimer.controllers', (m, i) => {
     const nodeLabel = m.get(`zephyr.hwtimer.controllers.${i}.nodeLabel`) as string;
     const counterParent = m.get(`zephyr.hwtimer.controllers.${i}.counterParent`) as string | undefined;
+    const compatible = m.get(`zephyr.hwtimer.controllers.${i}.compatible`) as string | undefined;
     if (!nodeLabel) return null;
-    return { nodeLabel, ...(counterParent ? { counterParent } : {}) };
+    return {
+      nodeLabel,
+      ...(counterParent ? { counterParent } : {}),
+      ...(compatible ? { compatible } : {}),
+    };
   });
 
   // Storage partition synthesis (boards whose DTS ships no storage_partition
@@ -231,11 +263,17 @@ export function resolveChipFromBoard(
   const usbController = bc.get('zephyr.usb.controller') as string | undefined;
   const usbCdcInstances = bc.get('zephyr.usb.cdcInstances') as number | undefined;
   const wakeTimer = bc.get('zephyr.power.wakeTimer') as boolean | undefined;
-  const i2sControllers: { nodeLabel: string; compatible: string }[] = [];
+  const i2sControllers: { nodeLabel: string; compatible: string; dmaLabel?: string; pads?: { ck?: string; sd?: string; ws?: string } }[] = [];
   for (let ii = 0; bc.get(`zephyr.i2s.controllers.${ii}.nodeLabel`) !== undefined; ii++) {
+    const dmaLabel = bc.get(`zephyr.i2s.controllers.${ii}.dmaLabel`) as string | undefined;
+    const ck = bc.get(`zephyr.i2s.controllers.${ii}.ck`) as string | undefined;
+    const sd = bc.get(`zephyr.i2s.controllers.${ii}.sd`) as string | undefined;
+    const ws = bc.get(`zephyr.i2s.controllers.${ii}.ws`) as string | undefined;
     i2sControllers.push({
       nodeLabel: String(bc.get(`zephyr.i2s.controllers.${ii}.nodeLabel`)),
       compatible: String(bc.get(`zephyr.i2s.controllers.${ii}.compatible`)),
+      ...(dmaLabel !== undefined ? { dmaLabel: String(dmaLabel) } : {}),
+      ...(ck !== undefined || sd !== undefined || ws !== undefined ? { pads: { ...(ck !== undefined ? { ck } : {}), ...(sd !== undefined ? { sd } : {}), ...(ws !== undefined ? { ws } : {}) } } : {}),
     });
   }
   const canControllers: { nodeLabel: string; compatible: string; txPad?: number; rxPad?: number }[] = [];
@@ -286,6 +324,11 @@ export function resolveChipFromBoard(
     };
   });
   const wifiSupported = bc.get('zephyr.wifi.supported') as boolean | undefined;
+  // The silicon's declared identity from the harvest (`st,stm32f411`) —
+  // DATA for series-keyed shim tables (the DBGMCU debug-sleep shape).
+  const socCompatible = bc.get('zephyr.soc.compatible') as string | undefined;
+  // SRAM size from the harvest — DATA for the Kconfig stack-floor clamp.
+  const ramKb = bc.get('zephyr.memory.ramKb') as number | undefined;
 
   // ── Custom-board generator inputs (MCU silicon) ─────────────────────────
   // Only complete when the MCU package carried a default console + clock
@@ -355,9 +398,9 @@ export function resolveChipFromBoard(
     gpioController: zGpioController ?? 'gpio0',
     ...(gc.length > 0 ? { gpioControllers: gc } : {}),
     gpio,
-    ...(i2cControllers.length > 0 ? { i2c: { controllers: i2cControllers } } : {}),
-    ...(spiControllers.length > 0 ? { spi: { controllers: spiControllers } } : {}),
-    ...(uartControllers.length > 0 ? { uart: { controllers: uartControllers } } : {}),
+    ...(i2cTyped.length > 0 ? { i2c: { controllers: i2cTyped } } : {}),
+    ...(spiTyped.length > 0 ? { spi: { controllers: spiTyped } } : {}),
+    ...(uartTyped.length > 0 ? { uart: { controllers: uartTyped } } : {}),
     ...(pwmSpecs.length > 0 || pwmMatrix
       ? {
           pwm: {
@@ -386,6 +429,7 @@ export function resolveChipFromBoard(
       ? { storage: { offset: storageOffset, size: storageSize, ...(storagePreexisting ? { preexisting: true } : {}) } }
       : {}),
     ...(wakeTimer ? { powerWakeTimer: true } : {}),
+    ...(socSupportsBusPinRemux(soc) ? { busPinRemux: true } : {}),
     ...(canControllers.length > 0 ? { can: { controllers: canControllers } } : {}),
     ...(i2sControllers.length > 0 ? { i2s: { controllers: i2sControllers } } : {}),
     ...(usbController && usbCdcInstances && usbCdcInstances > 0
@@ -408,7 +452,12 @@ export function resolveChipFromBoard(
           },
         }
       : {}),
-    ...(wifiSupported ? { wifi: { supported: true as const } } : {}),
+    // Three-state: true/false from a fresh harvest, undefined when no
+    // catalog backed this chip (probe flows) — the strategy only judges
+    // WiFi usage on an explicit no-radio fact.
+    ...(wifiSupported !== undefined ? { wifi: { supported: wifiSupported } } : {}),
+    ...(socCompatible ? { socCompatible } : {}),
+    ...(ramKb !== undefined ? { ramKb } : {}),
     ...(probeMethods.length > 0 ? { probeMethods } : {}),
     ...(customBoard ? { customBoard } : {}),
   };

@@ -25,12 +25,35 @@ function stem(instance: number): string {
  */
 export function threadStateLines(instance: number, stackBytes: number): string[] {
   const p = stem(instance);
+  // SINGLETON block: the thread state carries program-wide identity (one
+  // stack/trampoline per instance index). With program-wide shim content
+  // every TU stamps the block, and K_THREAD_STACK_DEFINE has EXTERNAL
+  // linkage — N TUs meant N definitions of the same symbol and the link
+  // failed. The entry TU carries the definitions; every other TU gets
+  // externs with the DECLARED bounds (K_THREAD_STACK_SIZEOF reads them).
+  // The two guards keep any header/.cpp splice order within one TU safe.
+  // Per-instance guard names: the block repeats once per thread index, and
+  // a shared guard would let the first instance's sighting swallow every
+  // later instance's definitions.
   return [
     '// CUTTLEFISH_THREAD_BEGIN',
+    '#if defined(CUTTLEFISH_ENTRY_TU)',
+    `#ifndef CUTTLEFISH_THREAD${instance}_SINGLETON_DEFS`,
+    `#define CUTTLEFISH_THREAD${instance}_SINGLETON_DEFS`,
     `K_THREAD_STACK_DEFINE(${p}_stack, ${stackBytes});`,
-    `static struct k_thread ${p}_thread;`,
-    `static void (*${p}_fn)(void) = NULL;`,
-    `static void ${p}_tramp(void* a, void* b, void* c) { (void)a; (void)b; (void)c; if (${p}_fn) { ${p}_fn(); } }`,
+    `struct k_thread ${p}_thread;`,
+    `void (*${p}_fn)(void) = NULL;`,
+    `void ${p}_tramp(void* a, void* b, void* c) { (void)a; (void)b; (void)c; if (${p}_fn) { ${p}_fn(); } }`,
+    `#endif // CUTTLEFISH_THREAD${instance}_SINGLETON_DEFS`,
+    '#else // !CUTTLEFISH_ENTRY_TU',
+    `#ifndef CUTTLEFISH_THREAD${instance}_SINGLETON_DECLS`,
+    `#define CUTTLEFISH_THREAD${instance}_SINGLETON_DECLS`,
+    `extern k_thread_stack_t ${p}_stack[K_THREAD_STACK_LEN(${stackBytes})];`,
+    `extern struct k_thread ${p}_thread;`,
+    `extern void (*${p}_fn)(void);`,
+    `extern void ${p}_tramp(void* a, void* b, void* c);`,
+    `#endif // CUTTLEFISH_THREAD${instance}_SINGLETON_DECLS`,
+    '#endif // CUTTLEFISH_ENTRY_TU',
     '// CUTTLEFISH_THREAD_END',
   ];
 }

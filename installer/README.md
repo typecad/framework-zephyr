@@ -135,9 +135,12 @@ summary names the file to trim by hand.
 3. Installs activation hooks that export `ZEPHYR_BASE` + `ZEPHYR_SDK_INSTALL_DIR`.
 4. Fetches + verifies + extracts the Zephyr SDK (minimal + selected toolchains,
    or the full bundle).
-5. Runs `west init --mr <rev>` + `west update`, then installs Zephyr's Python
-   build requirements (`requirements-base.txt` + build-relevant per-module
-   requirements such as `esptool`).
+5. Runs `west init --mr <rev> -o=--depth=1` — the zephyr manifest repo is
+   shallow-cloned at the pinned tag (the full history is never downloaded;
+   nothing downstream reads zephyr git history) — then `west update` fetches
+   the manifest projects, and Zephyr's Python build requirements are installed
+   (`requirements-base.txt` + build-relevant per-module requirements such as
+   `esptool`).
 
 No `sudo`, no Zephyr SDK `setup.sh` — the SDK is used in place via
 `ZEPHYR_SDK_INSTALL_DIR`.
@@ -299,8 +302,11 @@ chocolatey (`choco install dtc`) or the SDK's `setup.cmd`.
 - **Linux: flashing requires root / udev rules** — install the upstream udev
   rules once (the SDK `setup.sh` that installs them is deliberately skipped);
   see the [Zephyr Linux setup docs](https://docs.zephyrproject.org/latest/develop/getting_started/installation_linux.html).
-- **`west update` is slow** — it clones zephyr + all manifest projects on the
-  first run. Subsequent runs are incremental.
+- **`west update` is slow** — it clones every manifest project on the first
+  run. Subsequent runs are incremental. The zephyr manifest repo itself is
+  already shallow (`west init -o=--depth=1`); the modules cannot be
+  depth-limited because zephyr's manifest pins them by SHA, and GitHub rejects
+  `--depth` fetches that resolve a SHA.
 
 ## Layout
 
@@ -313,7 +319,7 @@ packages/framework-zephyr/installer/
   lib/
     detect-platform.sh         uname → conda + SDK platform tokens
     fetch-sdk.sh               full-bundle or minimal+toolchains download/verify/extract
-    init-workspace.sh          west init --mr <rev> + west update + Python requirements
+    init-workspace.sh          west init --mr <rev> (depth 1) + west update + Python requirements
     write-activation.sh        drop activate.d/deactivate.d hooks into the env
   etc/conda/
     activate.d/zephyr.{sh,bat,ps1}    export ZEPHYR_BASE + ZEPHYR_SDK_INSTALL_DIR

@@ -11,7 +11,7 @@ import { writeFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 
 import { join } from 'node:path';
 import { resolveKconfigFragments, type KconfigUsage } from '../dt-config/kconfig.js';
 import { scanSensorParts, scanStrips, scanHid, scanMatrix } from './index.js';
-import { profileFromEmittedSource, transportFor, panelControllerFor } from '../display/profiles.js';
+import { profileFromEmittedSource, transportFor, panelControllerFor, dbiHostFor } from '../display/profiles.js';
 import { readDisplayBinding } from '../display/bindings.js';
 import { readCuttlefishLibrarySidecar } from '@typecad/cuttlefish/library-packages';
 import { SENSOR_PART_INFO } from '@typecad/hal';
@@ -38,7 +38,11 @@ export function writeIfChanged(filePath: string, content: string): boolean {
  */
 function listEmittedSources(srcDir: string): string[] {
   if (!existsSync(srcDir)) return [];
-  const names = readdirSync(srcDir).filter((name) => name.endsWith('.cpp') || name.endsWith('.c'));
+  // Headers ride along: a class-held HAL carrier emits its driver verbs
+  // (adc_read, i2c_write_read, …) into the class's INLINE method bodies in
+  // the .h — a .cpp-only scan misses them and the Kconfig gate starves the
+  // driver (CONFIG_ADC undefined at link, `adc_gain_invert_64` unresolved).
+  const names = readdirSync(srcDir).filter((name) => name.endsWith('.cpp') || name.endsWith('.c') || name.endsWith('.h'));
   names.sort();
   return names;
 }
@@ -98,7 +102,7 @@ export function appendLibraryOverlayFragments(overlay: string, projectRoot: stri
  *
  * Idempotent. Mirrors scaffoldEspIdfProject's writeIfChanged discipline.
  */
-export function scaffoldZephyrProject(projectRoot: string, debug = false, userKconfig?: Record<string, string>, psram?: 'opi' | 'quad', trace?: { enabled?: boolean; intervalMs?: number }): boolean {
+export function scaffoldZephyrProject(projectRoot: string, debug = false, userKconfig?: Record<string, string>, psram?: 'opi' | 'quad', trace?: { enabled?: boolean; intervalMs?: number }, clockShimParentCompatible?: string, ramKb?: number): boolean {
   const srcDir = join(projectRoot, 'src');
   if (!existsSync(srcDir)) mkdirSync(srcDir, { recursive: true });
 
@@ -122,6 +126,10 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
     return src.includes(token);
   };
   const usage: KconfigUsage = {
+    // std::variant / std::holds_alternative / std::get on a variant need
+    // C++17 — the scaffold pins CPP14 unless the program lowers these.
+    needsCpp17: /std::(variant|optional|holds_alternative|get<)[^;]*|std::get<\d+>\(/.test(src)
+      && (src.includes('std::variant') || src.includes('holds_alternative')),
     usesAdc: uses('adc_'),
     usesPwm: uses('pwm_'),
     usesStrip: uses('led_strip'),
@@ -135,7 +143,16 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
     matrix: scanMatrix(src),
     usesPower: uses('sys_poweroff'),
     usesClock: uses('__tc_rtc'),
-    usesCan: uses('can_'),
+    // Resolved AFTER the chip is known (compile passes the clock shim
+    // parent's binding compatible; scaffold-at-prepare has no chip and
+    // omits it — the RTC-class driver forcing rides the compile-time
+    // scaffold rerun, which happens before west reads prj.conf).
+    clockShimParentCompatible,
+    // Same compile-time seam: the SRAM fact behind the stack-floor clamp.
+    ramKb,
+    // __tc_can, not 'can_' — the WiFi scan shim's own identifiers contain
+    // 'can_' and would enable the can@ controller for every WiFi program.
+    usesCan: uses('__tc_can'),
     canLoopback: uses('CAN_MODE_LOOPBACK'),
     usesI2s: uses('i2s_'),
     // No chip facts at scaffold time — the prepare overlay omits the shim;
@@ -154,9 +171,13 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
     // DT-bound sensor parts: the __tc_sensor_* state references and the
     // sensor_sample_fetch/sensor_channel_get calls both carry the token.
     usesSensor: uses('sensor_') || uses('__tc_sensor'),
-    usesFloatFormat: /%[-0-9.]*[eEfFgG]/.test(src),
+    usesFloatFormat: /%[-0-9.*]*[eEfFgG]/.test(src) || src.includes('__tc_toFixed('),
     usesSpi: uses('spi_') || uses('__tc_spi'),
     usesUart: uses('uart_') || uses('__tc_uart'),
+    // The RX ring's arming calls uart_irq_* — those APIs are only REAL when
+    // the driver is built interrupt-driven; otherwise they are empty stubs,
+    // the ISR never fires, and every byte read returns -1 forever.
+    usesUartRx: uses('__tc_uartrx') || uses('uart_irq_'),
     // USB CDC serial: every usb.* lowering calls into the __tc_usb<N>_* shim
     // (device + init helper emitted under usesUsb).
     usesUsb: uses('__tc_usb0'),
@@ -168,7 +189,7 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
     // Display transport + controller: recovered from the profile marker the
     // display adapters stamp into the emitted source (the profile registry is
     // the single source of truth — no geometry re-derivation here).
-    ...((): Pick<KconfigUsage, 'displayTransport' | 'displayController' | 'displayBus' | 'displayKconfigExtra'> => {
+    ...((): Pick<KconfigUsage, 'displayTransport' | 'displayController' | 'displayDbiHost' | 'displayBus' | 'displayKconfigExtra'> => {
       const profile = profileFromEmittedSource(src);
       if (!profile) return {};
       // Registry profiles name a DT compatible via dtCompatible (the driver
@@ -179,7 +200,10 @@ export function scaffoldZephyrProject(projectRoot: string, debug = false, userKc
       // and no bus at all.
       if (profile.boardProvidesDisplay) return { displayKconfigExtra: profile.kconfig };
       if (transportFor(profile) !== 'zephyr-display') return {};
-      return { displayTransport: 'zephyr-display', displayController: panelControllerFor(profile) };
+      // dbiHost rides along: a local-hold-cs profile's app-local host
+      // defines the mipi_dbi node's device — the Kconfig layer keeps the
+      // in-tree bridge off or the two definitions collide at link.
+      return { displayTransport: 'zephyr-display', displayController: panelControllerFor(profile), displayDbiHost: dbiHostFor(profile) };
     })(),
     usesTouch: uses('ft6336u') || uses('touch_'),
     // (The power HAL is removed; its former pm_/k_sleep token scan is gone —

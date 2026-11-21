@@ -157,3 +157,12 @@ export function lowerSensor(op: HALOpIR): { code?: string; expression?: string }
       );
   }
 }
+
+
+// ── Op C++ return types (the single definition site) ─────────────────────
+// Beside the lowering case that emits it; served to the engine via the
+// strategy's halOpCppType seam (see wifi.ts for the contract).
+export const OP_CPP_RETURN_TYPES: Readonly<Record<string, string>> = {
+  // Zephyr's sensor channel value is a double (val1 + val2/1e6).
+  'sensor.get': 'double',
+};

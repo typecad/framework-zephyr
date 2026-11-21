@@ -1003,7 +1003,9 @@ function runCheck(options: SbomPresenterOptions): void {
     recorded = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
   } catch {
     ui.printError(
-      `No readable CycloneDX SBOM at ${file} — run 'typecad-hal build' (which stamps one) or 'typecad-hal sbom'.`,
+      `No readable CycloneDX SBOM at ${file}.\n\n` +
+        `Build the project (which stamps one), or generate one directly:\n\n` +
+        `${ui.commandBlock('npx typecad-hal build', 'npx typecad-hal sbom')}`,
     );
     process.exitCode = 1;
     return;
@@ -1025,7 +1027,8 @@ function runCheck(options: SbomPresenterOptions): void {
     const sbomM = runner.statMtimeMs(file);
     if (binM !== null && sbomM !== null && binM > sbomM) {
       ui.printError(
-        `The firmware binary (${inv.artifact.path}) is newer than the recorded SBOM — rebuild or re-run 'typecad-hal sbom'.`,
+        `The firmware binary (${inv.artifact.path}) is newer than the recorded SBOM.\n\n` +
+          `Regenerate the SBOM by running:\n\n${ui.commandBlock('npx typecad-hal sbom')}`,
       );
       process.exitCode = 1;
       return;

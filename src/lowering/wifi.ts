@@ -46,7 +46,7 @@ export function wifiInitLines(): string[] {
     `// WiFi state. connected reflects IP connectivity (L4), not just link —`,
     `// join takes the iface admin-up (net_if_up) and conn_mgr_monitor raises`,
     `// the L4 event once DHCP completes (or the static-IPv4 facts are applied).`,
-    `static struct {`,
+    `struct __tc_wifi_state {`,
     `    bool inited;              // net_mgmt handlers registered + iface resolved`,
     `    bool connected;           // set by NET_EVENT_L4_CONNECTED/DISCONNECTED`,
     `    bool scanning;            // scan kicked, awaiting NET_EVENT_WIFI_SCAN_DONE`,
@@ -58,7 +58,10 @@ export function wifiInitLines(): string[] {
     `    __tc_wifi_cb_t on_disconnect;  // fired by NET_EVENT_L4_DISCONNECTED`,
     `    __tc_wifi_cb_t on_connect;     // fired by NET_EVENT_IPV4_ADDR_ADD (DHCP)`,
     `    struct k_work disconnect_work; // deferred on_disconnect (k_work_submit)`,
-    `} __tc_wifi = { false, false, false, 0, {}, {}, {}, nullptr, nullptr, nullptr, {} };`,
+    `}; struct __tc_wifi_state __tc_wifi __attribute__((weak)) = { false, false, false, 0, {}, {}, {}, nullptr, nullptr, nullptr, {} };  // NAMED state type: anonymous-struct variables internalize even under weak (see mqtt) — one instance firmware-wide.`,
+    `// WEAK: one instance firmware-wide — the per-TU static copy split link`,
+    `// state across TUs (the join flag set in one TU, linked() reading a`,
+    `// fresh zero copy in another — round-7 finding, demo-uplink).`,
     ``,
     `// ── net_mgmt event handler ──────────────────────────────────────────────`,
     `// One callback for both event families. L4 events drive \`connected\`; WiFi`,
@@ -207,6 +210,11 @@ export function wifiInitLines(): string[] {
     `// join(): the thin station verb — associate from the construction facts,`,
     `// apply the optional static-IPv4 / power-save facts, then bounded-wait for`,
     `// IP connectivity. Returns whether the link came up (boolean, no exceptions).`,
+    // SSID/PSK marshalling: a literal passes as const char*, a string-
+    // typed VARIABLE (a `const std::string WIFI_SSID` global) arrives as
+    // std::string — the overload folds both to the buffer-copying char*.
+    `static inline const char* __tc_wifi_str(const char* s) { return s; }`,
+    `static inline const char* __tc_wifi_str(const std::string& s) { return s.c_str(); }`,
     `static bool __tc_wifi_join(const char* ssid, const char* psk,`,
     `                           enum wifi_security_type security, int32_t channel,`,
     `                           enum wifi_frequency_bands band, int32_t timeout_ms,`,
@@ -399,10 +407,10 @@ export function lowerWifi(op: HALOpIR): { code?: string; expression?: string } |
         : sec === 3 ? 'WIFI_SECURITY_TYPE_PSK_SAE'
         : 'WIFI_SECURITY_TYPE_PSK';
       const bandEnum = Number(o.band ?? 0) === 1 ? 'WIFI_FREQ_BAND_5_GHZ' : 'WIFI_FREQ_BAND_2_4_GHZ';
-      return { expression: `__tc_wifi_join(${s(o.ssid)}, ${o.psk != null ? s(o.psk) : 'nullptr'}, ${secEnum}, ${s(o.channel ?? 0)}, ${bandEnum}, ${s(o.timeoutMs ?? 15000)}, ${Number(o.ps ?? 0) !== 0 ? 'true' : 'false'}, ${o.ipAddr != null ? s(o.ipAddr) : 'nullptr'}, ${o.gateway != null ? s(o.gateway) : 'nullptr'}, ${o.netmask != null ? s(o.netmask) : 'nullptr'})` };
+      return { expression: `__tc_wifi_join(__tc_wifi_str(${s(o.ssid)}), ${o.psk != null ? `__tc_wifi_str(${s(o.psk)})` : 'nullptr'}, ${secEnum}, ${s(o.channel ?? 0)}, ${bandEnum}, ${s(o.timeoutMs ?? 15000)}, ${Number(o.ps ?? 0) !== 0 ? 'true' : 'false'}, ${o.ipAddr != null ? s(o.ipAddr) : 'nullptr'}, ${o.gateway != null ? s(o.gateway) : 'nullptr'}, ${o.netmask != null ? s(o.netmask) : 'nullptr'})` };
     }
     case 'wifi.connect_start':
-      return { code: `__tc_wifi_connect_start(${s(o.ssid)}, ${o.password != null ? s(o.password) : 'nullptr'});` };
+      return { code: `__tc_wifi_connect_start(__tc_wifi_str(${s(o.ssid)}), ${o.password != null ? `__tc_wifi_str(${s(o.password)})` : 'nullptr'});` };
     case 'wifi.disconnect':
       return { code: `__tc_wifi_disconnect();` };
     case 'wifi.is_connected':
@@ -423,7 +431,9 @@ export function lowerWifi(op: HALOpIR): { code?: string; expression?: string } |
     case 'wifi.scan_done':
       return { expression: `(!__tc_wifi.scanning)` };
     case 'wifi.scan_count':
-      return { expression: `((int32_t)__tc_wifi.scan_count)` };
+      // static_cast: the C-style form violated A5-2-2 under --autosar=strict
+      // (demo-uplink round 7 — the emitter must be compliant by construction).
+      return { expression: `static_cast<int32_t>(__tc_wifi.scan_count)` };
     case 'wifi.scan_ssid':
     case 'wifi.scan_rssi':
     case 'wifi.scan_encryption':
@@ -459,3 +469,29 @@ export function lowerWifi(op: HALOpIR): { code?: string; expression?: string } |
       return undefined;
   }
 }
+
+
+// ── Op C++ return types (the single definition site) ─────────────────────
+// Declared BESIDE the lowering cases that emit them; the strategy's
+// halOpCppType seam serves this table to the engine (emit/utils/
+// hal-op-cpp-type.ts), whose specifier ladders pick printf formats from it.
+// An untyped double or a mistyped pointer reaching %d/%s is varargs garbage
+// on hardware. Statement ops (wifi.scan, connect_start, disconnect) return
+// no value and stay out of the table.
+export const OP_CPP_RETURN_TYPES: Readonly<Record<string, string>> = {
+  'wifi.local_ip': 'const char*',
+  // The helper packs the 6 MAC bytes into a uint64 — a NUMBER (the old
+  // engine table said const char*, which made `${WiFi.mac()}` printf %s
+  // over an integer).
+  'wifi.mac': 'uint64_t',
+  'wifi.scan_ssid': 'const char*',
+  'wifi.scan_encryption': 'const char*',
+  'wifi.is_connected': 'bool',
+  'wifi.join': 'bool',
+  'wifi.scan_done': 'bool',
+  'wifi.ap_start': 'bool',
+  'wifi.rssi': 'int32_t',
+  'wifi.scan_count': 'int32_t',
+  'wifi.scan_rssi': 'int32_t',
+  'wifi.scan_channel': 'int32_t',
+};

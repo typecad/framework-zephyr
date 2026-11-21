@@ -39,6 +39,26 @@ function monoPropFallback(prop: string, info: RequiredProp | undefined, nativeHe
   return undefined;
 }
 
+/** Binding-REQUIRED devicetree properties per sensor compatible, with the
+ *  value the binding's own example documents. The synthesized child node
+ *  emitted only compatible+reg; a binding that marks further properties
+ *  required fails devicetree validation BEFORE west runs — the part is
+ *  unconstructible (demo-terra round 10 F1: sensirion_sht4x/shtcx). Scope
+ *  is the enum-with-sane-default family; parts whose required props are
+ *  DESIGN PARAMETERS (fuel gauges' design-capacity, ina219's shunt values)
+ *  deliberately have NO entry — those must come from construction opts, and
+ *  emitting a junk default would silently mis-measure.
+ *
+ *  NOTE: the durable fix is the catalog generator harvesting required props
+ *  from each binding at build time (GENERATOR_REV bump); this table is the
+ *  in-tree bridge until then. */
+const REQUIRED_SENSOR_DT_PROPS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  'sensirion,sht4x': ['repeatability = <1>;'],
+  'sensirion,sts4x': ['repeatability = <1>;'],
+  'sensirion,shtcx': ['measure-mode = "normal";'],
+  'sensirion,stcc4': ['measurement-mode = <1>;'], // single-shot: fetch on demand
+};
+
 /** Format one binding-required property with its harvested default. Binding
  *  props that are deliberately default-free ("panel specific" — e.g. the
  *  sitronix gamma arrays) fall back to the rig-validated tuning the curated
@@ -194,15 +214,25 @@ export function generateOverlay(
   // The pinmux header include is collected and spliced before all blocks
   // (tokens must be defined before use).
   const pinctrlIncludes = new Map<string, string[]>();
-  const controllerBlock = (c: { nodeLabel: string; pinctrlRef?: string; props?: readonly string[]; pinctrl?: { include: string; pinmux: readonly string[]; inputPinmux?: readonly string[]; defines?: readonly string[] } }): void => {
+  const controllerBlock = (c: { nodeLabel: string; pinctrlRef?: string; pinctrlGroupName?: string; props?: readonly string[]; pinctrl?: { include: string; pinmux: readonly string[]; inputPinmux?: readonly string[]; defines?: readonly string[] } }): void => {
     const extra: string[] = [...(c.props ?? [])];
     if (c.pinctrl) {
-      pinctrlIncludes.set(c.pinctrl.include, c.pinctrl.defines ? [...c.pinctrl.defines] : []);
-      const group = `${c.nodeLabel}_default`;
+      // The include may be a comma-joined chain (the ESP32 remux trio:
+      // common pinctrl + per-SoC pinmux macros + gpio sigmap) — split so
+      // each header gets its own #include line.
+      for (const inc of c.pinctrl.include.split(',')) {
+        pinctrlIncludes.set(inc.trim(), c.pinctrl.defines ? [...c.pinctrl.defines] : []);
+      }
+      // Config-remuxed groups must not collide with the board's own
+      // <label>_default groups (a redefinition is a DT error).
+      const group = c.pinctrlGroupName ?? `${c.nodeLabel}_default`;
       lines.push('&pinctrl {');
       lines.push(`    ${group}: ${group} {`);
       lines.push(`        group1 {`);
-      lines.push(`            pinmux = <${c.pinctrl.pinmux.join(', ')}>;`);
+      // Each token is one 32-bit cell — separate bracketed cells
+      // (`<A>, <B>`), the reference board dtsis' form. A comma INSIDE one
+      // bracket (`<A, B>`) is a DT grammar error.
+      lines.push(`            pinmux = ${c.pinctrl.pinmux.map((t) => `<${t}>`).join(', ')};`);
       lines.push(`        };`);
       if (c.pinctrl.inputPinmux && c.pinctrl.inputPinmux.length > 0) {
         lines.push(`        group2 {`);
@@ -258,6 +288,9 @@ export function generateOverlay(
     lines.push(`    tc_${sp.part.replace(/^SENSOR\./, '')}_i2c${sp.busIndex}_0x${addrHex}: ${nodeName}@${addrHex} {`);
     lines.push(`        compatible = "${info.compatible}";`);
     lines.push(`        reg = <0x${addrHex}>;`);
+    for (const prop of REQUIRED_SENSOR_DT_PROPS[info.compatible] ?? []) {
+      lines.push(`        ${prop}`);
+    }
     emitAlert(lines, chip, sp.alertPin, info.alert, 8);
     lines.push('    };');
     lines.push('};');
@@ -301,7 +334,12 @@ export function generateOverlay(
   if (usage.usesUart && chip.uart) {
     for (const [i, c] of chip.uart.controllers.entries()) {
       if (usage.uartUsedInstances && !usage.uartUsedInstances.includes(i)) continue;
-      controllerBlock(c);
+      // A config-remuxed uart (zephyr.buses — the synthesized controller)
+      // enables a node the SoC dtsi ships with no current-speed, and the
+      // ESP32 UART binding requires it (DT_INST_FOREACH reads it
+      // unconditionally). Board-wired uarts keep their own property.
+      const props = c.pinctrlGroupName !== undefined ? ['current-speed = <115200>;'] : [];
+      controllerBlock({ ...c, props });
     }
   }
   // Synthesized pinctrl groups reference pinmux tokens — splice their header
@@ -347,7 +385,7 @@ export function generateOverlay(
   // program actually drives (pwmUsedPins) so the DT carries no dead channels;
   // an undefined list (prepare-time overlay) emits all specs.
   if (usage.usesPwm && chip.pwm) {
-    emitPwmNodes(lines, chip, usage.pwmUsedPins);
+    emitPwmNodes(lines, chip, usage.pwmUsedPins, diagnostics);
   }
   // ADC: enable the ADC device node, and on SoCs whose channels carry a
   // pinctrl label (STM32: the pad stays in GPIO mode unless the ADC node's
@@ -370,7 +408,17 @@ export function generateOverlay(
   // nodeLabel references (the same label-less-child move the STM32 pwm
   // path uses).
   if (usage.usesHwtimer && chip.hwtimer) {
+    // On nRF, RTC1 IS the kernel system timer (drivers/timer/Kconfig.nrf_rtc
+    // makes NRF_RTC_TIMER depend on rtc1 staying disabled — enabling it here
+    // silently disarms the kernel clock and the link dies on
+    // sys_clock_cycle_get_32). A kernel-claimed counter is never free, so
+    // the overlay skips it; the instance numbering follows the remaining
+    // nodes. Same spirit as the ESP32 GPIO-matrix gate: the KERNEL's own
+    // claim decides, not a board name.
+    const kernelClaimed = new Set<string>();
+    if (/^nrf/.test(chip.soc)) kernelClaimed.add('rtc1');
     for (const c of chip.hwtimer.controllers) {
+      if (!c.counterParent && kernelClaimed.has(c.nodeLabel)) continue;
       if (c.counterParent) {
         lines.push(`&${c.counterParent} {`);
         lines.push('    status = "okay";');
@@ -393,15 +441,20 @@ export function generateOverlay(
   // matches the WS2812's native GRB order (the driver reorders). The
   // controller is enabled here too — a strip-only program emits no spi_*
   // calls, so the bus enable cannot ride the generic SPI usage path.
-  // `line-idle-low` keeps MOSI low between frames, the WS2812 reset level.
+  // `line-idle-low` keeps MOSI low between frames, the WS2812 reset level —
+  // an espressif-SPI-binding property (CPOL-0 hardware holds the line low
+  // natively, so the binding-specific escape is unnecessary there).
   if (usage.usesStrip && usage.strips && usage.strips.length > 0) {
     lines.splice(2, 0, '#include <zephyr/dt-bindings/led/led.h>', '');
     for (const s of usage.strips) {
       const ctrl = chip.spi?.controllers[s.index];
       if (!ctrl) continue;
+      const idleLow = ctrl.compatible === 'espressif,esp32-spi' || ctrl.compatible === undefined;
       lines.push(`&${ctrl.nodeLabel} {`);
       lines.push('    status = "okay";');
-      lines.push('    line-idle-low;');
+      if (idleLow) {
+        lines.push('    line-idle-low;');
+      }
       lines.push(`    tc_strip${s.index}: ws2812@0 {`);
       lines.push('        compatible = "worldsemi,ws2812-spi";');
       lines.push('        reg = <0>;');
@@ -416,38 +469,73 @@ export function generateOverlay(
       lines.push('');
     }
   }
-  // I2S: enable the board's own i2s@ controllers — their pinctrl groups
-  // are board-authored (the devkitC wires i2s0_default/i2s1_default), so
-  // status is the only synthesis needed. The GDMA the ESP32 I2S driver
-  // DMA-runs through also ships disabled — enable it alongside.
-  // Full-duplex: the RX side's I_BCK/I_WS inputs must be routed in the
-  // GPIO matrix to the same pads the TX outputs drive (input-enable on
-  // the TX clock pads — the same-pad GPIO matrix trick the CAN loopback
-  // uses; the devkitC's i2s0 clock pads are WS=36, BCK=37).
+  // I2S: enable the controllers the program drives (per-instance, like the
+  // buses — an STM32 i2s1 node shares silicon with spi1 and must never be
+  // enabled alongside it). The per-family overlay shape follows the
+  // controller's HARVESTED FACTS, not its name:
+  //   - AF-table pads harvested from the SoC pinctrl dtsi (STM32 and every
+  //     other letter-port family whose silicon data is devicetree): enable
+  //     the node's own `dmas` phandle controller and synthesize the node's
+  //     pinctrl-0 from the group labels — the st,stm32-i2s binding requires
+  //     pinctrl and a disabled DMA controller never instantiates its driver.
+  //   - The espressif binding (pinctrl lives in macro headers, the family
+  //     GDMA ships disabled, full-duplex needs the RX clock inputs looped
+  //     onto the TX clock pads through the GPIO matrix — the same-pad
+  //     input-enable trick the CAN loopback uses; the devkitC's i2s0 clock
+  //     pads are WS=36, BCK=37).
+  //   - Anything else: a bare enable — the board's own DT wires its pinctrl
+  //     or the driver probe reports honestly; synthesizing another family's
+  //     DMA node or pinmux macros here is a devicetree parse failure.
   if (usage.usesI2s && chip.i2s) {
-    lines.push('&dma {');
-    lines.push('    status = "okay";');
-    lines.push('};');
-    lines.push('');
-    for (const c of chip.i2s.controllers) {
-      const n = c.nodeLabel.replace(/[^0-9]/g, '') || '0';
-      lines.push(`&${c.nodeLabel} {`);
-      lines.push('    status = "okay";');
-      lines.push('};');
-      lines.push('');
-      lines.push('&pinctrl {');
-      lines.push('    tc_i2s_clock_loop: tc-i2s-clock-loop {');
-      lines.push('        group1 {');
-      lines.push(`            pinmux = <I2S${n}_I_BCK_GPIO37>,`);
-      lines.push(`                     <I2S${n}_I_WS_GPIO36>;`);
-      lines.push('        };');
-      lines.push('    };');
-      lines.push('};');
-      lines.push(`&${c.nodeLabel} {`);
-      lines.push(`    pinctrl-0 = <&${c.nodeLabel}_default>, <&tc_i2s_clock_loop>;`);
-      lines.push('    pinctrl-names = "default";');
-      lines.push('};');
-      lines.push('');
+    for (const [i, c] of chip.i2s.controllers.entries()) {
+      if (usage.i2sUsedInstances && !usage.i2sUsedInstances.includes(i)) continue;
+      const pads = c.pads;
+      if (pads && (pads.ck || pads.sd || pads.ws)) {
+        if (c.dmaLabel) {
+          lines.push(`&${c.dmaLabel} {`);
+          lines.push('    status = "okay";');
+          lines.push('};');
+          lines.push('');
+        }
+        lines.push(`&${c.nodeLabel} {`);
+        lines.push('    status = "okay";');
+        const groups = [pads.ck, pads.sd, pads.ws].filter((g): g is string => g !== undefined);
+        lines.push(`    pinctrl-0 = <${groups.map((g) => `&${g}`).join(' ')}>;`);
+        lines.push('    pinctrl-names = "default";');
+        lines.push('};');
+        lines.push('');
+      } else if (c.compatible === 'espressif,esp32-i2s' || c.compatible === undefined) {
+        // "i2s" itself carries a digit — strip the family PREFIX for the
+        // instance number, not the non-digits (i2s0 → 0; stripping [^0-9]
+        // yields 20 and names macros — I2S20_* — no header defines).
+        const n = c.nodeLabel.replace(/^i2s/, '') || '0';
+        lines.push('&dma {');
+        lines.push('    status = "okay";');
+        lines.push('};');
+        lines.push('');
+        lines.push(`&${c.nodeLabel} {`);
+        lines.push('    status = "okay";');
+        lines.push('};');
+        lines.push('');
+        lines.push('&pinctrl {');
+        lines.push(`    tc_i2s${n}_clock_loop: tc-i2s${n}-clock-loop {`);
+        lines.push('        group1 {');
+        lines.push(`            pinmux = <I2S${n}_I_BCK_GPIO37>,`);
+        lines.push(`                     <I2S${n}_I_WS_GPIO36>;`);
+        lines.push('        };');
+        lines.push('    };');
+        lines.push('};');
+        lines.push(`&${c.nodeLabel} {`);
+        lines.push(`    pinctrl-0 = <&${c.nodeLabel}_default>, <&tc_i2s${n}_clock_loop>;`);
+        lines.push('    pinctrl-names = "default";');
+        lines.push('};');
+        lines.push('');
+      } else {
+        lines.push(`&${c.nodeLabel} {`);
+        lines.push('    status = "okay";');
+        lines.push('};');
+        lines.push('');
+      }
     }
   }
   // CAN: enable the board's own can@ controller (the harvested node —
@@ -591,14 +679,41 @@ export function generateOverlay(
   // partition differently. It only adds a /chosen pointer (never redeclares
   // the partition node — west errors if a node is multiply-defined).
   if (usage.usesPreferences || usage.usesFS) {
-    // Boards whose DTS ships no storage_partition (most STM32s define only
-    // the MCUboot boot/slot/scratch set) declare a synthesis region in the
-    // chip descriptor — emit it as a partition@<offset> child of the flash0
-    // partitions node. Adding a NEW child via overlay is legal; redeclaring
-    // an existing one is not, so boards that already carry the label
-    // (descriptor storage.preexisting — ESP32's AMP layout) skip the
-    // synthesis block and only the /chosen pointer lands here.
-    if (chip.storage && !chip.storage.preexisting) {
+    // ── Settings/littlefs partition arbitration (demo-pumphouse round 5 F9)
+    //
+    // ZMS (Store) and littlefs (File) BOTH target the storage region with
+    // MUTUALLY EXCLUSIVE on-flash formats, and neither knows the other
+    // exists: littlefs mounts with a format-on-failure fallback, and ZMS
+    // raw-walks its sectors from the region start. One partition shared by
+    // both = whichever mounts second corrupts the other — and littlefs
+    // residue from ANY previous demo (the partition survives app reflashes)
+    // makes ZMS's boot walk abort on the foreign blocks: saves still commit
+    // and claim success, loads after reset silently deliver nothing. The
+    // fix is isolation by construction: whenever Preferences are used, ZMS
+    // gets its OWN settings_partition carved from the front of the region;
+    // littlefs keeps storage_partition (shifted past the settings block
+    // when both are present). A demo's settings then survive even OTHER
+    // demos' littlefs usage on the same board.
+    // Tail placement: settings_partition takes the LAST SETTINGS_BLOCK of
+    // the region and storage_partition shrinks in place. On preexisting
+    // boards the new sibling MUST NOT share the existing node's unit address
+    // — dtc merges same-address nodes, which fused both labels onto one
+    // partition in the first cut of this fix.
+    const SETTINGS_BLOCK = 0x8000; // 32 KB — ZMS needs ≥2 pages; this is roomy.
+    const region = chip.storage;
+    const canSplit = !!region && (region.offset % 0x1000 === 0) && region.size >= SETTINGS_BLOCK + 0x8000;
+    const split = usage.usesPreferences && canSplit;
+    const storageOff = region ? region.offset : 0;
+    const storageSize = region ? (split ? region.size - SETTINGS_BLOCK : region.size) : 0;
+    const settingsOff = region ? region.offset + storageSize : 0;
+    const hex8 = (n: number): string => `0x${n.toString(16).padStart(8, '0')}`;
+    const settingsNode = (): string[] => [
+      `        settings_partition: partition@${settingsOff.toString(16)} {`,
+      '            label = "settings";',
+      `            reg = <${hex8(settingsOff)} ${hex8(SETTINGS_BLOCK)}>;`,
+      '        };',
+    ];
+    if (region && !region.preexisting) {
       lines.push('&flash0 {');
       // Explicit compatible + cells: boards whose DTS already carries a
       // partitions node (rp2040, STM32 MCUboot sets) merge identically, and
@@ -609,21 +724,45 @@ export function generateOverlay(
       lines.push('        compatible = "fixed-partitions";');
       lines.push('        #address-cells = <1>;');
       lines.push('        #size-cells = <1>;');
-      lines.push(`        storage_partition: partition@${chip.storage.offset.toString(16)} {`);
+      if (split) lines.push(...settingsNode());
+      lines.push(`        storage_partition: partition@${storageOff.toString(16)} {`);
       lines.push('            label = "storage";');
-      lines.push(`            reg = <0x${chip.storage.offset.toString(16).padStart(8, '0')} 0x${chip.storage.size.toString(16).padStart(8, '0')}>;`);
+      lines.push(`            reg = <${hex8(storageOff)} ${hex8(storageSize)}>;`);
       lines.push('        };');
       lines.push('    };');
+      lines.push('};');
+      lines.push('');
+    } else if (region && region.preexisting && split) {
+      // The board DTS already declares storage_partition at a fixed offset
+      // (ESP32 AMP layout). Shrinking it via a reg override (legal overlay
+      // property assignment) frees the tail block; settings_partition is
+      // added as a NEW sibling child at the freed unit address (adding
+      // children is legal; redeclaring the existing node is not).
+      lines.push('&flash0 {');
+      lines.push('    partitions {');
+      lines.push(...settingsNode());
+      lines.push('    };');
+      lines.push('};');
+      lines.push(`&storage_partition {`);
+      lines.push(`    reg = <${hex8(storageOff)} ${hex8(storageSize)}>;`);
       lines.push('};');
       lines.push('');
     }
     if (usage.usesPreferences) {
       lines.push('/ {');
       lines.push('    chosen {');
-      lines.push('        zephyr,settings-partition = &storage_partition;');
+      lines.push(split
+        ? '        zephyr,settings-partition = &settings_partition;'
+        : '        zephyr,settings-partition = &storage_partition;');
       lines.push('    };');
       lines.push('};');
       lines.push('');
+    }
+    if (usage.usesPreferences && !canSplit && region) {
+      diagnostics.push({
+        severity: "warning",
+        message: `preferences: the storage region (${region.size} bytes at 0x${region.offset.toString(16)}) is too small to split into separate settings/littlefs partitions — Store (ZMS) and File (littlefs) will share it, where each can corrupt the other across reboots. Prefer a board with a larger storage region, or use only one of the two subsystems.`,
+      });
     }
   }
 
@@ -737,6 +876,7 @@ function emitPwmNodes(
   lines: string[],
   chip: ZephyrChipDescriptor,
   usedPins?: readonly number[],
+  diagnostics: OverlayDiagnostic[] = [],
 ): void {
   const staticSynth = (chip.pwm?.specs ?? []).filter(
     (s) => s.controller && s.channel != null && !s.dtSpec,
@@ -773,10 +913,22 @@ function emitPwmNodes(
     if (isNrfMatrix) {
       const inc = '#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>';
       if (!lines.includes(inc)) lines.splice(2, 0, inc, '');
+      // The binding names the property `psels` (nordic,nrf-pinctrl.yaml), and
+      // the nrf pinctrl consumer declares BOTH states: the SoC dtsi ships
+      // `pinctrl-names = "default", "sleep"` + a pinctrl-1, so an overlay that
+      // redefines pinctrl-0 with a one-name list leaves two pinctrl-N entries
+      // and one name ("pinctrl-names ... has 1 strings, expected 2"). Emit the
+      // sleep group too (port index 2 = the driver's sleep/disconnected form).
       lines.push('&pinctrl {');
       lines.push(`    tc_${m.controller}_default: tc-${m.controller}-default {`);
       lines.push('        group1 {');
-      lines.push(`            psel = ${pins.map((p, ch) => `<NRF_PSEL(PWM_OUT${ch}, ${Math.floor(p / 32)}, ${p % 32})>`).join(', ')};`);
+      lines.push(`            psels = ${pins.map((p, ch) => `<NRF_PSEL(PWM_OUT${ch}, ${Math.floor(p / 32)}, ${p % 32})>`).join(', ')};`);
+      lines.push('        };');
+      lines.push('    };');
+      lines.push(`    tc_${m.controller}_sleep: tc-${m.controller}-sleep {`);
+      lines.push('        group1 {');
+      lines.push(`            psels = ${pins.map((p, ch) => `<NRF_PSEL(PWM_OUT${ch}, ${Math.floor(p / 32)}, ${p % 32})>`).join(', ')};`);
+      lines.push('            low-power-enable;');
       lines.push('        };');
       lines.push('    };');
       lines.push('};');
@@ -784,7 +936,8 @@ function emitPwmNodes(
       lines.push(`&${m.controller} {`);
       lines.push('    status = "okay";');
       lines.push(`    pinctrl-0 = <&tc_${m.controller}_default>;`);
-      lines.push('    pinctrl-names = "default";');
+      lines.push(`    pinctrl-1 = <&tc_${m.controller}_sleep>;`);
+      lines.push('    pinctrl-names = "default", "sleep";');
       lines.push('};');
       lines.push('');
     }
@@ -851,9 +1004,15 @@ function emitPwmNodes(
     // preprocesses overlays together with the base DTS — no splice needed.
     const isMacro = (p: string | undefined): boolean => !!p && /^[A-Z][A-Z0-9_]*$/.test(p);
     if (!timersMatch && specs.some((s) => isMacro(s.pinctrl))) {
-      const header = rp2PinctrlHeader(chip.soc);
+      const header = rp2PinctrlHeader(chip.soc) ?? samPinctrlHeader(chip.soc);
       if (header) {
-        const inc = `#include <zephyr/dt-bindings/pinctrl/${header}>`;
+        // RP2's header ships in the zephyr tree's dt-bindings; the SAM0 one
+        // ships in the atmel module HAL's include/ (its dt-bindings root) —
+        // the same file the board's own pinctrl dtsi includes, no `zephyr/`
+        // prefix on either resolution path.
+        const inc = header.startsWith('samd21')
+          ? `#include <dt-bindings/pinctrl/${header}>`
+          : `#include <zephyr/dt-bindings/pinctrl/${header}>`;
         if (!lines.includes(inc)) lines.splice(2, 0, inc, '');
       }
       lines.push('&pinctrl {');
@@ -925,6 +1084,39 @@ function emitPwmNodes(
     lines.push('};');
     lines.push('');
   }
+  // Shared-period families: ONE counter per controller instance — nRF
+  // (COUNTERTOP per instance), STM32 (ARR per timer), RP2040/RP2350 (period
+  // per slice, channels A/B share it). ESP32 LEDC is excluded: its four
+  // timers round-robin per channel and the driver reconfigures on
+  // pwm_set_dt, so distinct per-channel periods are legal there. Two specs
+  // on one instance with different periods silently coerce the loser (the
+  // demo-fcu dongle overlay baked a 25 kHz fan and a 50 Hz servo onto one
+  // pwm0 — both cells carried the servo period and the fan would really
+  // have run at 50 Hz). Name the collision instead.
+  {
+    const socName = chip.soc ?? '';
+    const sharedPeriodSoc = /^(nrf|stm32)/.test(socName) || /^rp2/.test(socName);
+    if (sharedPeriodSoc) {
+      const byController = new Map<string, { pin: number; periodNs: number }[]>();
+      for (const sp of synthesized) {
+        if (!sp.controller) continue;
+        const periodNs = sp.periodNs ?? 20_000_000;
+        const list = byController.get(sp.controller) ?? [];
+        list.push({ pin: sp.pin ?? 0, periodNs });
+        byController.set(sp.controller, list);
+      }
+      for (const [controller, specs] of byController) {
+        const distinct = [...new Set(specs.map((x) => x.periodNs))];
+        if (distinct.length <= 1) continue;
+        const winner = specs.reduce((a, b) => (b.periodNs > a.periodNs ? b : a));
+        const losers = specs.filter((x) => x.pin !== winner.pin);
+        diagnostics.push({
+          severity: "warning",
+          message: `pwm: controller '${controller}' (${socName}) shares ONE period across its channels, but its pins want different periods: ${specs.map((x) => `pin ${x.pin} = ${(x.periodNs / 1_000_000).toFixed(3)} ms`).join(", ")}. The overlay bakes ${winner.periodNs} ns for the whole instance, so ${losers.map((x) => `pin ${x.pin}`).join(", ")} would run at the wrong frequency on hardware. Drive those pins from separate PWM instances (another timer/slice), or use one period per instance.`,
+        });
+      }
+    }
+  }
   lines.push('/ {');
   lines.push('    tc_pwm_leds: tc-pwm-leds {');
   lines.push('        compatible = "pwm-leds";');
@@ -973,6 +1165,20 @@ function rp2PinctrlHeader(soc: string): string | undefined {
   if (soc === 'rp2040') return 'rpi-pico-rp2040-pinctrl.h';
   if (soc.startsWith('rp2350a')) return 'rpi-pico-rp2350a-pinctrl.h';
   if (soc.startsWith('rp2350b')) return 'rpi-pico-rp2350b-pinctrl.h';
+  return undefined;
+}
+
+/** The per-SoC SAM0 pinmux-macro header (`PA8E_TCC0_WO0` lives in the
+ *  module HAL's dt-bindings, on the DTS include path exactly like the RP2
+ *  headers — the board's own *-pinctrl.dtsi includes the same file). The
+ *  header name encodes the package pincode (samd21g18a → da1g; the letter
+ *  the soc name carries after the series). Undefined for series this table
+ *  does not name — the route cross-check upstream keeps macro-form routes
+ *  only for timers the dtsi declares, so an unresolved header means the
+ *  overlay stays header-less rather than guessing a wrong file. */
+function samPinctrlHeader(soc: string): string | undefined {
+  const m = soc.match(/^samd21([egj])/);
+  if (m) return `samd21-da1${m[1]}Xabcd-pinctrl.h`;
   return undefined;
 }
 

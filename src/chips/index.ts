@@ -33,3 +33,23 @@ export function setActiveChip(d: ZephyrChipDescriptor): void {
 export function getActiveChip(): ZephyrChipDescriptor {
   return activeChip;
 }
+
+/**
+ * Per-controller I2S verb usage, stamped by the strategy's shim build (which
+ * folds the program's i2s.* ops per controller) and read by lowerI2s. The
+ * WRITE lowering needs it for the loopback discipline: when the program also
+ * READS on this controller, the first write must start the RX engine BEFORE
+ * the TX block clocks out — a lazily-started RX (first read) captures the
+ * underrun zeros that follow a single queued block, never the data.
+ */
+export type I2sVerbUsage = { write: boolean; read: boolean; readAt: boolean };
+
+let activeI2sUsage: Map<number, I2sVerbUsage> | undefined;
+
+export function setActiveI2sUsage(u: Map<number, I2sVerbUsage> | undefined): void {
+  activeI2sUsage = u;
+}
+
+export function getActiveI2sUsage(): Map<number, I2sVerbUsage> | undefined {
+  return activeI2sUsage;
+}

@@ -27,7 +27,10 @@
 // ----------------------------------------------------------------------------
 
 import type { BoardDataEntry } from '@typecad/cuttlefish/board-catalog';
+import { parseBusPins } from './boardgen/bus-pins.js';
+import { socSupportsBusPinRemux } from './chips/resolve.js';
 import { parseAsBuiltJson, type AsBuiltFile, type AsBuiltRoute } from './as-built.js';
+import { commandBlock } from '@typecad/cuttlefish/utils/ui';
 import {
   loadBoardCatalogOverlay,
   GENERATOR_REV,
@@ -35,9 +38,11 @@ import {
   factsFingerprint,
   findBoardInCatalog,
   socBusLabelsFromTree,
+  socFlashKbFromTree,
 } from '@typecad/cuttlefish/board-catalog';
 import type { ZephyrGpioController, ZephyrProbeMethod } from './chips/types.js';
 import { getBoardGateData } from '@typecad/cuttlefish/board-gate';
+import { wifiRadioIsDriven } from './wifi-radios.js';
 
 /** A generated pin: schematic name, JS-safe identifier, HAL number. */
 interface GenPin {
@@ -51,6 +56,10 @@ export interface GeneratedBoard {
   readonly boardJson: string;
   /** The resolved board record (identifier/name/vendor) — for build notes. */
   readonly board: BoardDataEntry;
+  /** The gated hardware classes the board's facts turned on — the same names
+   *  the boardTs re-exports. The contract board generator layers these onto
+   *  its narrowed board.ts (its own writer emits pins, not facts). */
+  readonly gatedExports: readonly string[];
   /** Non-fatal notes from generation — user facts shadowing harvested
    *  routes (the user won; the harvest said otherwise). */
   readonly warnings?: readonly string[];
@@ -66,8 +75,10 @@ function activeBoardData(): Record<string, BoardDataEntry> {
   const data = loadBoardCatalogOverlay()?.data as Record<string, BoardDataEntry> | undefined;
   if (!data) {
     throw new Error(
-      `No board catalog on this machine. The catalog is generated from your Zephyr tree —\n` +
-      `run 'typecad-hal board sync' (or point TYPECAD_HAL_BOARD_CATALOG at a catalog file).`,
+      `No board catalog on this machine. The catalog is generated from your Zephyr tree.\n\n` +
+      `Build it by running:\n\n` +
+      `${commandBlock('npx typecad-hal board sync')}\n\n` +
+      `or point the TYPECAD_HAL_BOARD_CATALOG environment variable at a catalog file.`,
     );
   }
   return data;
@@ -152,12 +163,17 @@ const ADC_CHANNEL_CFG: Record<string, { gain: string; reference: string }> = {
  * nRF uses P<port>.<bit>, Raspberry Pi GP<N>, Espressif GPIO<N>, and every
  * other family uses the controller's own port letters/digits.
  */
-type NamingConv = 'nrf-port' | 'rp-gpio' | 'esp32-gpio' | 'family';
+type NamingConv = 'nrf-port' | 'rp-gpio' | 'esp32-gpio' | 'sam0-port' | 'family';
 function namingConvFor(soc: string): NamingConv {
   const s = soc.toLowerCase();
   if (/^nrf5|^nrf9/.test(s)) return 'nrf-port';
   if (/^rp2/.test(s)) return 'rp-gpio';
   if (/^esp32/.test(s)) return 'esp32-gpio';
+  // Atmel SAM0 spells its DT GPIO controllers port<letter> (porta) — the
+  // letter-port convention the derived controller table and the route-port
+  // notes both follow. A 'PA8' parsed onto gpioa put the pin on a controller
+  // nodelabel the DT never declared (arduino_zero).
+  if (/^sam[a-z]/.test(s)) return 'sam0-port';
   return 'family';
 }
 
@@ -287,8 +303,24 @@ function deriveControllers(entry: BoardDataEntry): { controllers: ZephyrGpioCont
   // port no led/button/connector happens to sit on exports no PWM/ADC
   // routes (the blackpill lost 12 of 30 PWM routes and PB's ADC channels
   // to exactly this).
+  // The route's port letter is controller-relative; the NODELABEL spelling is
+  // the board's own convention (STM32 `gpioa`, Atmel `porta`, Atmel legacy
+  // `pioa`). The note used to hardcode `gpio<letter>`, synthesizing phantom
+  // controllers on boards whose DT spells ports differently — the derived
+  // table then carried BOTH gpioa (never declared) and porta (the real one),
+  // the pin placed on the phantom, and the emitted
+  // DEVICE_DT_GET(DT_NODELABEL(gpioa)) referenced nothing (arduino_zero).
+  // Resolve against the DT-declared controllers; the gpio<letter> default
+  // covers the STM32-class boards whose facts the convention was written for.
+  const letterCtrl = (letter: string): string => {
+    const declared = (entry.gpioControllers ?? []).map((c) => c.nodelabel);
+    for (const cand of [`gpio${letter}`, `port${letter}`, `pio${letter}`]) {
+      if (declared.includes(cand)) return cand;
+    }
+    return `gpio${letter}`;
+  };
   for (const r of [...(entry.pwmPins ?? []), ...(entry.adcPins ?? []), ...(entry.dacPins ?? [])]) {
-    note(`gpio${r.port.toLowerCase()}`, r.bit);
+    note(letterCtrl(r.port.toLowerCase()), r.bit);
   }
   // ESP32 numbered-GPIO family: routes carry global pads (no port letters);
   // the gpio0 convention covers 0-48 on these SoCs.
@@ -338,11 +370,33 @@ function deriveControllers(entry: BoardDataEntry): { controllers: ZephyrGpioCont
     letterBase += width;
   }
 
+  // Controllers the SoC dtsi declares with an explicit pin count but no
+  // name-derivable range (the MPS2 FPGAIO gpio_led0/gpio_button IPs, the
+  // ESP32 LP cores' lp_gpio): sweepable silicon. Their bases are handed out
+  // SEQUENTIALLY above every derived range — a per-controller minPin of 0
+  // made two such controllers overlap (PLED0 and PBUTTON0 both resolving to
+  // HAL pin 0 — the collision the old opaque slots existed to prevent).
+  const declaredWidths: { name: string; ngpios: number }[] = [];
   for (const name of maxBits.keys()) {
     if (/^gpio[a-p]$/.test(name)) continue;
     const range = controllerRangeFor(name);
-    if (range) derived.push(range);
-    else opaque.add(name);
+    if (range) {
+      derived.push(range);
+      continue;
+    }
+    const declared = (entry.gpioControllers ?? []).find((c) => c.nodelabel === name);
+    if (declared?.ngpios !== undefined) {
+      declaredWidths.push({ name, ngpios: declared.ngpios });
+    } else {
+      opaque.add(name);
+    }
+  }
+  if (declaredWidths.length > 0) {
+    let declaredBase = derived.length > 0 ? Math.max(...derived.map((c) => c.maxPin)) + 1 : 0;
+    for (const d of declaredWidths.sort((a, b) => a.name.localeCompare(b.name))) {
+      derived.push({ nodelabel: d.name, minPin: declaredBase, maxPin: declaredBase + d.ngpios - 1 });
+      declaredBase += d.ngpios;
+    }
   }
   // Opaque controllers: deterministic sequential slots far above any
   // derived range so HAL pin numbers never collide.
@@ -431,7 +485,10 @@ export function parsePinName(soc: string, name: string): { controller: string; p
     return { controller: 'gpio', pin: num };
   }
   m = n.match(/^P([A-Pa-p])(\d{1,2})$/);
-  if (m) return { controller: `gpio${m[1].toLowerCase()}`, pin: Number(m[2]) };
+  if (m) {
+    if (conv === 'sam0-port') return { controller: `port${m[1].toLowerCase()}`, pin: Number(m[2]) };
+    return { controller: `gpio${m[1].toLowerCase()}`, pin: Number(m[2]) };
+  }
   return undefined;
 }
 
@@ -513,12 +570,30 @@ export function buildModule(
   userFacts?: UserBoardFacts,
   factsSuffix = '',
   seedWarnings: readonly string[] = [],
+  busPinSpecs: readonly import('./boardgen/bus-pins.js').BusPinSpec[] = [],
 ): GeneratedBoard {
   // The ungated surface is derived from the project's own hal copy — same
   // resolution (project → cwd → monorepo sibling) as the engine's HAL parser.
   const { ungated: BOARD_UNGATED_EXPORTS, ungatedTypes: BOARD_UNGATED_TYPE_EXPORTS } = getBoardGateData();
   const soc = socOfTarget(entry.identifier);
   const conv = namingConvFor(soc);
+
+  // HP-domain facts vs the target's own devicetree: the ESP32 SoC harvest
+  // (ADC pads, the LEDC matrix) describes the HP domain. A target whose
+  // devicetree declares no gpio0 (the C3/C6/C5 LP cores — lp_gpio only)
+  // cannot route those facts: dropping them here beats minting a controller
+  // the target's devicetree doesn't have (undefined `__device_dts_ord_…` at
+  // C++ compile time). Devicetree data, not a name branch — the same
+  // harvest places normally on every target that declares the controller.
+  // Positive-signal only: an entry WITHOUT a devicetree controller
+  // inventory (synthetic boards, older catalog records) carries no domain
+  // information — only a PRESENT inventory that names no gpio0 (the LP
+  // cores) drops the harvest.
+  const dtControllers = entry.gpioControllers ?? [];
+  const hpFactsRoutable = !(dtControllers.length > 0 && !dtControllers.some((c) => c.nodelabel === 'gpio0'));
+  if (!hpFactsRoutable && ((entry.espAdc?.length ?? 0) > 0 || entry.pwmMatrix)) {
+    entry = { ...entry, espAdc: undefined, pwmMatrix: undefined };
+  }
 
   // ── Controller table + datasheet sweep (the same for every board) ──────
   const { controllers, opaque } = deriveControllers(entry);
@@ -600,10 +675,16 @@ export function buildModule(
   for (const r of [...(entry.espAdc ?? [])]
     .filter((x) => espAdcUnits.includes(x.source))
     .sort((x, y) => x.source.localeCompare(y.source, undefined, { numeric: true }) || x.channel - y.channel)) {
-    const ctrl = controllers.find((c) => c.nodelabel === 'gpio0');
-    if (!ctrl || r.pad > ctrl.maxPin - ctrl.minPin) continue;
+    // The pad in the macro IS the global silicon pad; find the gpio port
+    // that OWNS it (the exported-pin guard — a pad the board never declares
+    // stays unexported). The classic ESP32 splits its pads across two ports
+    // (gpio0: 0-31, gpio1: 32-63), so the old gpio0-only lookup silently
+    // dropped the whole ADC1 half (pads 32-39) — and `minPin + pad` would
+    // have double-counted the port base there.
+    const ctrl = controllers.find((c) => r.pad >= c.minPin && r.pad <= c.maxPin);
+    if (!ctrl) continue;
     siliconAdc.push({
-      pin: ctrl.minPin + r.pad,
+      pin: r.pad,
       channel: r.channel,
       ...(r.source !== espAdcUnit ? { controller: r.source } : {}),
     });
@@ -732,7 +813,7 @@ export function buildModule(
   }
   // ESP32 DAC: silicon-fixed channel→pad (no pinctrl group, no harvested
   // route). Only when no pinctrl DAC was harvested and the soc has the DAC.
-  const esp32Dac = esp32DacPins(soc);
+  const esp32Dac = hpFactsRoutable ? esp32DacPins(soc) : undefined;
   if (siliconDac.length === 0 && esp32Dac) {
     const gpio0 = controllers.find((c) => c.nodelabel === 'gpio0');
     for (const [channel, pad] of esp32Dac) {
@@ -830,7 +911,36 @@ export function buildModule(
   // channels; specs ride virtual pins from 8192 (above every real range and
   // the opaque controller blocks).
   const pwmLedSpecs = (entry.pwmLeds ?? []).filter((l) => l.alias);
-  const buses = entry.buses ?? { i2c: [], spi: [], uart: [] };
+  let buses = entry.buses ?? { i2c: [] as string[], spi: [] as string[], uart: [] as string[] };
+  // Config-specified bus controllers (zephyr.buses — the ESP32 pin matrix):
+  // each becomes an available controller at its HAL selector index. Adding
+  // to the arrays flows everywhere: the board module's singletons + class
+  // gating, the peripherals.<bus>.count capacity constants, and the
+  // zephyr.<bus>.controllers.<i>.* constants the chip reconstruction and
+  // overlay read.
+  const busPinByKindIndex = new Map<string, import('./boardgen/bus-pins.js').BusPinSpec>();
+  for (const spec of busPinSpecs) busPinByKindIndex.set(`${spec.kind}:${spec.index}`, spec);
+  if (busPinSpecs.length > 0) {
+    const merged: Record<'i2c' | 'spi' | 'uart', string[]> = { i2c: [...buses.i2c], spi: [...buses.spi], uart: [...buses.uart] };
+    for (const kind of ['i2c', 'spi', 'uart'] as const) {
+      for (const spec of busPinSpecs.filter((s) => s.kind === kind).sort((a, b) => a.index - b.index)) {
+        // The selector index must land on the array densely: either on an
+        // existing controller (remux — the synthesized pinctrl overrides
+        // its routes) or exactly one past the end (append). A gap would
+        // fabricate an un-pinned controller at the skipped index.
+        if (spec.index > merged[kind].length) {
+          userWarnings.push(`zephyr.buses: ${kind}${spec.index} skips ${kind}${merged[kind].length} — specify the skipped controller too; ignored.`);
+          continue;
+        }
+        if (spec.index === merged[kind].length) {
+          merged[kind].push(spec.nodeLabel);
+        } else {
+          merged[kind][spec.index] = spec.nodeLabel;
+        }
+      }
+    }
+    buses = merged;
+  }
   // nRF PWM: any GPIO pad can carry any channel of a PWM peripheral (psel
   // routing — pinctrl psel order IS channel order), so it is a matrix like
   // the ESP32's LEDC: channels are assigned to the driven pads at overlay
@@ -985,38 +1095,57 @@ export function buildModule(
   ts.push(`export type { ${BOARD_UNGATED_TYPE_EXPORTS.join(', ')} } from '@typecad/hal/core';`);
   ts.push('');
   ts.push('// Hardware this board actually has — unavailable hardware is not importable.');
-  if (wdtNodeLabel) ts.push(`export { Watchdog } from '@typecad/hal/core';`);
-  if (siliconPwm.length > 0 || pwmLedSpecs.length > 0 || pwmMatrix) ts.push(`export { PWM, Servo } from '@typecad/hal/core';`);
-  if (siliconAdc.length > 0) ts.push(`export { ADC } from '@typecad/hal/core';`);
-  if (siliconDac.length > 0) ts.push(`export { DAC } from '@typecad/hal/core';`);
-  // The responder rides the same wired-bus fact as I2CTarget — target-mode
-  // support is a controller-driver property discovered at registration
-  // (-ENOSYS prints loudly), never a board-name gate.
-  if (buses.i2c.length > 0) ts.push(`export { I2CTarget, I2CResponder } from '@typecad/hal/core';`);
-  if (buses.spi.length > 0) ts.push(`export { SPITarget } from '@typecad/hal/core';`);
-  if (buses.uart.length > 0) ts.push(`export { UART } from '@typecad/hal/core';`);
-  if (hwtimerControllers.length > 0) ts.push(`export { Counter } from '@typecad/hal/core';`);
-  // Clock rides the same free-counter facts (the zephyr,rtc-counter shim
-  // wraps the counter when the board ships no hardware rtc alias).
-  if (hwtimerControllers.length > 0) ts.push(`export { Clock } from '@typecad/hal/core';`);
-  // CAN rides the harvested controller nodes (ESP32 TWAI, STM32 bxCAN,
-  // NXP FlexCAN…); a SoC with none exports nothing.
-  if ((entry.canNodes ?? []).length > 0) ts.push(`export { CAN } from '@typecad/hal/core';`);
-  // I2S rides the harvested i2s@ controllers.
-  if ((entry.i2sNodes ?? []).length > 0) ts.push(`export { I2S } from '@typecad/hal/core';`);
-  // Power rides the SoC's declared cpu-power-states (both the ESP32 family's
-  // standby + soft-off pair and STM32's suspend-to-idle count; a SoC with no
-  // declared states exports nothing).
-  if ((entry.powerStates ?? []).length > 0) ts.push(`export { Power } from '@typecad/hal/core';`);
-  // KEY/MOUSE are ungated token tables — the derived always-available
-  // re-export line above already carries them on every board; only the HID
-  // device classes ride the USB gate.
-  if (hasUsb) ts.push(`export { USBConsole, Keyboard, Mouse } from '@typecad/hal/core';`);
-  // Store/File: a persisted backend needs a storage region — either the
-  // board's own storage_partition (harvested reg) or a synthesizable one
-  // (flash size known, no existing partition to collide with).
-  if (entry.storageReg || (entry.flashKb && !entry.hasStoragePartition)) {
-    ts.push(`export { Store, File } from '@typecad/hal/core';`);
+  // The gate table IS the board's hardware surface: each row names the gated
+  // classes this board's facts support and the exact re-export line emitted
+  // for them. gatedExports accumulates the names so the contract generator
+  // can layer the same surface onto its narrowed board.ts.
+  const gatedExportRows: { on: boolean; names: readonly string[] }[] = [
+    { on: !!wdtNodeLabel, names: ['Watchdog'] },
+    { on: siliconPwm.length > 0 || pwmLedSpecs.length > 0 || !!pwmMatrix, names: ['PWM', 'Servo'] },
+    { on: siliconAdc.length > 0, names: ['ADC'] },
+    { on: siliconDac.length > 0, names: ['DAC'] },
+    // The responder rides the same wired-bus fact as I2CTarget — target-mode
+    // support is a controller-driver property discovered at registration
+    // (-ENOSYS prints loudly), never a board-name gate.
+    { on: buses.i2c.length > 0, names: ['I2CTarget', 'I2CResponder'] },
+    { on: buses.spi.length > 0, names: ['SPITarget'] },
+    { on: buses.uart.length > 0, names: ['UART'] },
+    { on: hwtimerControllers.length > 0, names: ['Counter'] },
+    // Clock rides the same free-counter facts (the zephyr,rtc-counter shim
+    // wraps the counter when the board ships no hardware rtc alias).
+    { on: hwtimerControllers.length > 0, names: ['Clock'] },
+    // CAN rides the harvested controller nodes (ESP32 TWAI, STM32 bxCAN,
+    // NXP FlexCAN…); a SoC with none exports nothing.
+    { on: (entry.canNodes ?? []).length > 0, names: ['CAN'] },
+    // I2S rides the harvested i2s@ controllers.
+    { on: (entry.i2sNodes ?? []).length > 0, names: ['I2S'] },
+    // BLE rides the Bluetooth controller the devicetree chooses
+    // (zephyr,bt-hci) — ESP32/nRF/STM32WB pick one, a radioless SoC picks none.
+    { on: entry.btHci !== undefined, names: ['BLE'] },
+    // WiFi rides a harvested radio the Wi-Fi Kconfig block can drive
+    // (wifi-radios.ts) — presence alone would admit radios with no driver
+    // selection and fail deep in the build.
+    { on: wifiRadioIsDriven(entry.wifiRadio), names: ['WiFi', 'Scan', 'WiFiAP'] },
+    // Power rides the SoC's declared cpu-power-states (both the ESP32 family's
+    // standby + soft-off pair and STM32's suspend-to-idle count; a SoC with no
+    // declared states exports nothing).
+    { on: (entry.powerStates ?? []).length > 0, names: ['Power'] },
+    // KEY/MOUSE are ungated token tables — the derived always-available
+    // re-export line above already carries them on every board; only the HID
+    // device classes ride the USB gate.
+    { on: hasUsb, names: ['USBConsole', 'Keyboard', 'Mouse'] },
+    // Store/File: a persisted backend needs a storage region — the board's
+    // own storage_partition (harvested reg, or merely labeled: the backend
+    // resolves it through the zephyr,settings-partition chosen pointer the
+    // overlay adds, so a labeled-but-unharvested partition qualifies), or a
+    // synthesizable one (flash size known, no existing partition to collide).
+    { on: !!(entry.storageReg || entry.hasStoragePartition || (entry.flashKb && !entry.hasStoragePartition)), names: ['Store', 'File'] },
+  ];
+  const gatedExports = gatedExportRows.flatMap((row) => (row.on ? row.names : []));
+  // Preserve the exact per-row export lines (a row with multiple names
+  // emits ONE line naming them all — the historical byte shape).
+  for (const row of gatedExportRows) {
+    if (row.on) ts.push(`export { ${row.names.join(', ')} } from '@typecad/hal/core';`);
   }
   ts.push('');
   if (pins.length > 0) {
@@ -1156,6 +1285,14 @@ export function buildModule(
     constants['zephyr.power.softOff'] = powerStates.some((ps) => ps.name === 'soft-off');
   }
   if (entry.rtcWakeTimer) constants['zephyr.power.wakeTimer'] = true;
+  // SRAM size — the Kconfig stack floors scale from it (a 12 KB board
+  // cannot hold the full-C++ 8K+8K floors; the linker region overflows).
+  if (entry.ramKb) constants['zephyr.memory.ramKb'] = entry.ramKb;
+  // The silicon's declared identity + the radio fact — three-state at the
+  // resolver (true/false from a fresh harvest; undefined = no catalog).
+  if (entry.socCompatible) constants['zephyr.soc.compatible'] = entry.socCompatible;
+  constants['zephyr.wifi.supported'] = wifiRadioIsDriven(entry.wifiRadio);
+  constants['zephyr.ble.supported'] = entry.btHci !== undefined;
   // CAN controllers — the harvested labeled nodes (the CAN class gate). The
   // ESP32 TWAI pads ride along: loopback overlays route both TWAI functions
   // onto the TX pad.
@@ -1169,6 +1306,15 @@ export function buildModule(
   (entry.i2sNodes ?? []).forEach((c, i) => {
     constants[`zephyr.i2s.controllers.${i}.nodeLabel`] = c.nodeLabel;
     constants[`zephyr.i2s.controllers.${i}.compatible`] = c.compatible;
+    // STM32-style facts: the node's own DMA controller + the AF-table
+    // pinctrl groups (ESP32 nodes carry neither — the family's overlay
+    // shape synthesizes the GDMA enable and the GPIO-matrix clock loop).
+    if (c.dmaLabel !== undefined) constants[`zephyr.i2s.controllers.${i}.dmaLabel`] = c.dmaLabel;
+    if (c.pads !== undefined) {
+      if (c.pads.ck !== undefined) constants[`zephyr.i2s.controllers.${i}.ck`] = c.pads.ck;
+      if (c.pads.sd !== undefined) constants[`zephyr.i2s.controllers.${i}.sd`] = c.pads.sd;
+      if (c.pads.ws !== undefined) constants[`zephyr.i2s.controllers.${i}.ws`] = c.pads.ws;
+    }
   });
   constants['peripherals.i2c.count'] = buses.i2c.length;
   constants['peripherals.spi.count'] = buses.spi.length;
@@ -1371,6 +1517,27 @@ export function buildModule(
       constants[`zephyr.uart.controllers.${i}.pads`] = routes.filter((r) => r.pad).map((r) => `${r.role ?? ''}=${r.pad}`).join(',');
     }
   });
+  // Binding identity per wired controller — collectBusControllers rebuilds
+  // it into the chip view so overlay decisions key on devicetree data.
+  (entry.busCompatibles ?? []).forEach((c) => {
+    constants[`zephyr.${c.bus}.compatibles.${c.nodelabel}`] = c.compatible;
+  });
+  // Config-specified bus controllers (zephyr.buses): the synthesized
+  // pinctrl group rides the controller constants — collectBusControllers
+  // (chips/resolve) reconstructs it into the chip view, so the C++ shims
+  // address the right nodelabel and the overlay emits the remux group +
+  // enables the controller. Written AFTER the harvest blocks so a remuxed
+  // controller's synthesis replaces its harvested route names (the config
+  // wiring is the user's ground truth).
+  for (const spec of busPinSpecs) {
+    const i = spec.index;
+    const prefix = `zephyr.${spec.kind}.controllers.${i}`;
+    constants[`${prefix}.nodeLabel`] = spec.nodeLabel;
+    constants[`${prefix}.pinctrl.include`] = spec.include;
+    constants[`${prefix}.pinctrl.pinmux`] = spec.pinmux.join(',');
+    constants[`${prefix}.pinctrlGroupName`] = spec.groupName;
+  }
+
   // The board's console controller (chosen zephyr,console) — the
   // diagnostics annotate the UART instance the bootloader logs on.
   if (entry.console) constants['zephyr.console'] = entry.console;
@@ -1420,6 +1587,7 @@ export function buildModule(
   hwtimerControllers.forEach((c, i) => {
     constants[`zephyr.hwtimer.controllers.${i}.nodeLabel`] = c.nodeLabel ?? `tc_counter${i}`;
     if (c.parentLabel) constants[`zephyr.hwtimer.controllers.${i}.counterParent`] = c.parentLabel;
+    if (c.compatible) constants[`zephyr.hwtimer.controllers.${i}.compatible`] = c.compatible;
   });
 
   // Probe methods — the debug-config writer and `west flash` runner choice
@@ -1462,6 +1630,7 @@ export function buildModule(
     boardTs: ts.join('\n'),
     boardJson: JSON.stringify(manifest, null, 1),
     board: entry,
+    gatedExports,
     ...(userWarnings.length > 0 ? { warnings: userWarnings } : {}),
   };
 }
@@ -1473,14 +1642,14 @@ export function buildModule(
  */
 export function generateBoard(
   target: string,
-  opts?: { factsJson?: string; asBuiltJson?: string },
+  opts?: { factsJson?: string; asBuiltJson?: string; busPins?: Record<string, Record<string, number>> },
 ): GeneratedBoard {
   const found = findBoardData(target);
   if (!found) {
     const hint = loadBoardCatalogOverlay()
-      ? `'${target}' is not a board target in the current catalog. ` +
-        `It may be new in your Zephyr tree — run 'typecad-hal board sync' and retry.`
-      : `No board catalog on this machine. Run 'typecad-hal board sync' first.`;
+      ? `'${target}' is not a board target in the current catalog.\n\n` +
+        `If it's new in your Zephyr tree, refresh the catalog and retry:\n\n${commandBlock('npx typecad-hal board sync')}`
+      : `No board catalog on this machine.\n\nBuild it first by running:\n\n${commandBlock('npx typecad-hal board sync')}`;
     throw new Error(hint);
   }
   // The as-built snapshot (this project's last successful build's resolved
@@ -1513,7 +1682,14 @@ export function generateBoard(
   // The hash only joins the fingerprint when the snapshot actually applied
   // (a foreign-board snapshot is ignored and must not force regeneration).
   if (asBuiltApplied && opts?.asBuiltJson !== undefined) suffix += factsFingerprint(opts.asBuiltJson);
-  return buildModule(entry, facts, suffix, asBuiltWarnings);
+  // Config-specified bus pins join the fingerprint — a pin change must
+  // regenerate the board module (its constants carry the remux).
+  const busPins = opts?.busPins;
+  const busPinsResult = parseBusPins(busPins, socOfTarget(found.identifier), socSupportsBusPinRemux(socOfTarget(found.identifier)));
+  if (busPins && Object.keys(busPins).length > 0) {
+    suffix += factsFingerprint(JSON.stringify(busPins));
+  }
+  return buildModule(entry, facts, suffix, [...asBuiltWarnings, ...busPinsResult.warnings], busPinsResult.specs);
 }
 
 /**
@@ -1585,7 +1761,17 @@ export function generateBoardModuleFromContract(opts: {
   padAliases?: readonly { exportName: string; padName: string }[];
   /** Which bus families the PCB routes. */
   peripherals: { i2c: boolean; spi: boolean; uart: boolean };
-}): { boardTs: string; boardJson: string } {
+  /** The physical build/flashing target (a real Zephyr board), when the
+   *  contract project carries one. Its catalog record is the truth west
+   *  compiles against — its storage/flash facts override the soc-dtsi
+   *  family harvest (an overlay-synthesized partition colliding with the
+   *  target board's own storage_partition is a dtc label error). */
+  buildTarget?: string;
+  /** Declared on-chip flash size (KB). Overrides the soc-dtsi flash
+   *  harvest (which cannot see external flash declared in a board dts);
+   *  a buildTarget catalog record still wins over it. */
+  storageKb?: number;
+}): { boardTs: string; boardJson: string; gatedExports: readonly string[] } {
   const pads: { name: string; controller: string; pin: number }[] = [];
   for (const name of opts.pinNames) {
     const parsed = parsePinName(opts.soc, name);
@@ -1610,6 +1796,32 @@ export function generateBoardModuleFromContract(opts: {
     uart: opts.peripherals.uart ? treeBuses.uart : [],
   };
 
+  // Storage/flash facts. When the project names a REAL build target, its
+  // catalog record wins (the target's dts is what west compiles against —
+  // synthesizing a second storage_partition against a board that ships one
+  // is a dtc duplicate-label error). Otherwise the soc-dtsi family harvest
+  // stands: smallest declared module size, region synthesized. An explicit
+  // storageKb declaration overrides the harvest — external-flash boards
+  // declare flash in the board dts, which the harvest can never see, and
+  // without a declared size Store/File stay gated off.
+  let flashKb = socFlashKbFromTree(opts.zephyrBase, opts.soc);
+  if (opts.storageKb) flashKb = opts.storageKb;
+  let storageReg: BoardDataEntry['storageReg'];
+  let hasStoragePartition: boolean | undefined;
+  if (opts.buildTarget) {
+    try {
+      const overlayData = loadBoardCatalogOverlay()?.data;
+      const targetEntry = overlayData ? findBoardInCatalog(overlayData, opts.buildTarget) : undefined;
+      if (targetEntry) {
+        if (targetEntry.flashKb) flashKb = targetEntry.flashKb;
+        if (targetEntry.storageReg) storageReg = targetEntry.storageReg;
+        if (targetEntry.hasStoragePartition) hasStoragePartition = true;
+      }
+    } catch {
+      // No machine-local catalog yet (first run) — the family harvest stands.
+    }
+  }
+
   // Synthetic catalog record shaped like a walker record, routed through the
   // SAME module builder as every board: the wired pads ride in as a
   // 'contract' connector (labels = datasheet names), and deriveControllers
@@ -1631,6 +1843,15 @@ export function generateBoardModuleFromContract(opts: {
       vendor: 'typecad',
       dts: '',
       buses: Object.values(buses).some((b) => b.length > 0) ? buses : undefined,
+      // Flash/storage facts: the build target's catalog record when the
+      // project names one (the truth west compiles against), else the
+      // soc-dtsi family harvest (module variants collapse to the smallest
+      // declared size — conservative for the synthesized storage region).
+      // Feeds the same Store/File + zephyr.storage.* path every catalog
+      // board uses; absent when neither source declares a size.
+      flashKb,
+      ...(storageReg ? { storageReg } : {}),
+      ...(hasStoragePartition ? { hasStoragePartition } : {}),
       connectors: padEntries.length > 0
         ? [{
             nodelabel: 'contract',

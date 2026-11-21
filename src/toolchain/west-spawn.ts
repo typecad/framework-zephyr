@@ -19,6 +19,7 @@ import type { SpawnSyncOptions } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { type WestInstall, discoverWest } from './west-discover.js';
+import { ZEPHYR_INSTALL_CMD } from '@typecad/cuttlefish/board-catalog';
 
 export interface WestInvocation {
   /** The command to spawnSync: a `west` launcher or a Python interpreter. */
@@ -122,9 +123,9 @@ export function westSpawn(
         'Zephyr workspace dirs (~/zephyrproject/.venv), and as a system',
         "Python module (`python -m west`). To fix:",
         '',
-        '  • Run the typeCAD Zephyr installer (one command, any OS — needs Node ≥18):',
-        '      node packages/zephyr-installer/install.mjs',
-        '    then `micromamba activate zephyr` and retry.',
+        '  • Run the typeCAD Zephyr installer (one command, any OS — needs Node ≥18),',
+        '    then retry:',
+        `      ${ZEPHYR_INSTALL_CMD}`,
         '  • Or activate an existing Zephyr venv in this shell, or',
         '  • Or set ZEPHYR_BASE to your Zephyr SDK root (the venv at $ZEPHYR_BASE/../.venv is then used), or',
         '  • Or install west into a discoverable Python: pip install west',

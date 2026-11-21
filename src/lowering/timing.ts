@@ -44,3 +44,12 @@ export function lowerTiming(
   }
 }
 
+
+// ── Op C++ return types (the single definition site) ─────────────────────
+// Beside the lowering cases that emit them; served to the engine via the
+// strategy's halOpCppType seam (see wifi.ts for the contract).
+export const OP_CPP_RETURN_TYPES: Readonly<Record<string, string>> = {
+  // JS numbers are doubles; both lowerings return static_cast<double>(...).
+  'timing.now': 'double',
+  'timing.now_us': 'double',
+};

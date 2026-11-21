@@ -63,6 +63,53 @@ export {
  */
 export function lowerHalOp(
   op: HALOpIR,
+): { code?: string; expression?: string; markers?: readonly string[] } | undefined {
+  const resolved = lowerHalOpInner(op);
+  if (resolved === undefined) return undefined;
+  const markers = OP_SHIM_MARKERS[op.operation] ?? OP_SHIM_MARKERS[prefixOf(op.operation)];
+  if (markers === undefined) return resolved;
+  return { ...resolved, markers };
+}
+
+function prefixOf(operation: string): string {
+  const dot = operation.indexOf('.');
+  return dot === -1 ? operation : `${operation.slice(0, dot + 1)}`;
+}
+
+/**
+ * The shim/usage markers each op CATEGORY rides — declared at the ONE
+ * dispatch point that lowers them (single definition site). The engine
+ * records these at resolution time (routeHALOp → CompilationContext.
+ * shimMarkers) and stamps usage-markers.json beside the emitted sources;
+ * the toolchain's overlay usage scan unions them over its text scan, so a
+ * capability never depends on its marker surviving verbatim in emitted text
+ * (helper tokens baked into a string payload, stripped or renamed code).
+ * Keys are category prefixes ('preferences.'); values are the exact tokens
+ * scanOverlayUsage greps for. Keep in sync with that scan's token families.
+ */
+const OP_SHIM_MARKERS: Readonly<Record<string, readonly string[]>> = {
+  'preferences.': ['__tc_prefs'],
+  'fs.': ['__tc_fs'],
+  'uart.': ['__tc_uart'],
+  'usb.': ['__tc_usb0'],
+  'can.': ['__tc_can'],
+  'clock.': ['__tc_rtc'],
+  'hid.': ['__tc_hid_'],
+  'matrix.': ['__tc_matrix'],
+  'hwtimer.': ['counter_', '__tc_hw'],
+  'counter.': ['counter_', '__tc_hw'],
+  'wdt.': ['wdt_'],
+  'dac.': ['__tc_dac'],
+  'strip.': ['led_strip'],
+  'i2c.': ['__tc_i2c'],
+  'spi.': ['__tc_spi'],
+  'adc.': ['adc_'],
+  'pwm.': ['pwm_'],
+  'i2s.': ['i2s_'],
+};
+
+function lowerHalOpInner(
+  op: HALOpIR,
 ): { code?: string; expression?: string } | undefined {
   const chip = getActiveChip();
 
